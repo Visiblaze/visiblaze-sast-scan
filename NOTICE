@@ -1,0 +1,34 @@
+Visiblaze SAST scan
+Copyright 2026 Visiblaze
+
+This product includes software developed at Visiblaze (https://visiblaze.com).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+This licence covers the contents of this repository — the composite action and
+its pin manifest. It does not grant any right to the Visiblaze platform or its
+APIs, which are provided under a separate commercial agreement.
+
+
+THIRD-PARTY SOFTWARE
+--------------------
+
+This action does not bundle or redistribute any third-party software. At run
+time, on your own runner, it downloads the following and verifies each against a
+digest pinned in pins.env before executing it. Each remains under its own
+licence, held by its own authors; the terms below are theirs, not ours.
+
+Opengrep — https://github.com/opengrep/opengrep
+    Licensed under the GNU Lesser General Public License, version 2.1
+    (LGPL-2.1). Opengrep is fetched as an unmodified upstream release binary and
+    executed as a separate program; it is not linked into, combined with, or
+    modified by anything in this repository. A copy of the LGPL-2.1 and the
+    corresponding source are available from the project above.
+
+Sigstore cosign — https://github.com/sigstore/cosign
+    Licensed under the Apache License, Version 2.0. Fetched as an unmodified
+    upstream release binary and used only to verify Opengrep's signature.
+
+Nothing here is a sublicence. If you redistribute this action together with
+either binary, the obligations of that binary's licence attach to you.

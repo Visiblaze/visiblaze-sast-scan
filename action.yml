@@ -1,0 +1,360 @@
+# Copyright 2026 Visiblaze
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Visiblaze — scan your source for vulnerabilities
+#
+# ── What this does, and what leaves your network ──
+#
+# The scan runs on YOUR runner, against the checkout that is already there. Your source code is
+# never uploaded. What leaves is a findings report: rule id, severity, file path, line numbers,
+# and — where the analysis found one — the source-to-sink data flow within a single file. Those
+# are locations in your code, not your code.
+#
+# It reads. It does not write, comment, annotate, or open pull requests. The only thing it can do
+# to your pipeline is set an exit code, and only if you ask it to with `fail-on`.
+#
+# ── There is no secret to configure ──
+#
+# Authentication is GitHub's own OIDC. The workflow needs `permissions: id-token: write`, and the
+# action mints a token that lives for minutes and states cryptographically which repository
+# produced it. Nothing is stored in your repository secrets, so there is nothing to rotate, leak
+# or revoke — and a token captured from a log cannot be replayed against another tenant.
+#
+# Your Visiblaze admin authorises your org or repo once, on our side. Until they do, this action
+# gets a 403 and says so.
+#
+# ── Every binary it runs is pinned and digest-verified ──
+#
+# This action downloads two executables onto your runner. Both are pinned to an exact version in
+# pins.env and both have their SHA-256 checked BEFORE execution; a mismatch aborts and runs
+# nothing. There is no "latest" anywhere, because a floating dependency inside a pinned action
+# would mean the SHA you pinned does not actually determine what runs on your machine.
+#
+# ── Composite, not Docker, on purpose ──
+#
+# A Docker action would mean trusting an image you cannot read. This is a shell script you can
+# review, running on your own runner. For a tool that reads all of your source, readable beats
+# convenient.
+name: Visiblaze SAST
+description: Scan your source for vulnerabilities on your own runner and send only the findings to Visiblaze. Your code never leaves your network.
+author: Visiblaze
+
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  tenant:
+    description: Your Visiblaze tenant id. Required — findings posted against the wrong tenant are not recoverable by re-running.
+    required: true
+  api-url:
+    description: >-
+      Your Visiblaze ingest endpoint. Required — we give you the exact URL when your organisation
+      is authorised, because it depends on which region your tenant lives in.
+    required: true
+  repo-key:
+    description: >-
+      The Visiblaze repository key, "github#<numeric repo id>". Defaults to the id of the
+      repository running the workflow, which is correct unless you are deliberately reporting on
+      behalf of another repository — and the server rejects that, so the default is what you want.
+    required: false
+    default: ""
+  path:
+    description: >-
+      Directory to scan, relative to the workspace. Defaults to the whole checkout. In a monorepo,
+      point one job per package at its own directory — the action then DECLARES that directory as
+      its coverage, so several jobs on one repository stop resolving each other's findings.
+    required: false
+    default: "."
+  scope:
+    description: >-
+      Override the declared coverage: a comma-separated list of repository-relative paths this run
+      covered. Only needed when one job scans several non-adjacent directories, since `path` is
+      declared automatically. Getting this WRONG is worse than leaving it empty — a scope narrower
+      than what you scanned means real fixes are never marked resolved.
+    required: false
+    default: ""
+  fail-on:
+    description: >-
+      Fail the job when a finding at or above this severity is present: critical, high, medium or
+      low. Empty by default, and that default is deliberate — a repository with existing debt would
+      otherwise be permanently red, and a check that can never go green is one people route around.
+      Findings are still reported when this is empty.
+    required: false
+    default: ""
+  fail-on-error:
+    description: >-
+      Fail the job if the scan or the upload itself fails. Default false: a scanner outage must not
+      be the reason a deploy pipeline goes red. Set true if you would rather know loudly. This is
+      independent of `fail-on`, which is about your code rather than about this tool.
+    required: false
+    default: "false"
+  dry-run:
+    description: Scan and print what would be sent, upload nothing. Use this for the first run so you can read exactly what leaves.
+    required: false
+    default: "false"
+
+outputs:
+  findings:
+    description: Number of findings reported.
+    value: ${{ steps.scan.outputs.findings }}
+  status:
+    description: One of sent, dry-run, failed.
+    value: ${{ steps.scan.outputs.status }}
+  policy:
+    description: One of pass, fail, not-applied — whether `fail-on` was met.
+    value: ${{ steps.scan.outputs.policy }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        VISIBLAZE_TENANT: ${{ inputs.tenant }}
+        VISIBLAZE_API: ${{ inputs.api-url }}
+        IN_REPO_KEY: ${{ inputs.repo-key }}
+        IN_PATH: ${{ inputs.path }}
+        IN_SCOPE: ${{ inputs.scope }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        GH_REPO_ID: ${{ github.event.repository.id }}
+        GH_REPOSITORY: ${{ github.repository }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+
+        # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
+        # rather than buried in a trailing `|| true`.
+        bail() {
+          local level="$1"; shift
+          echo "::${level}::visiblaze-sast: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          if [ "${FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
+          exit 0
+        }
+
+        # ── The pin, and the refusal to run without it ────────────────────────────────────
+        #
+        # Sourced rather than inlined so a version bump is a one-file diff with the digest
+        # visibly moving alongside the URL. `set -a` exports each KEY=value.
+        PINS="${ACTION_DIR}/pins.env"
+        [ -f "$PINS" ] || bail error "pins.env is missing from the action directory — refusing to download anything unpinned"
+        set -a
+        # shellcheck disable=SC1090
+        . "$PINS"
+        set +a
+
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH=amd64 ;;
+          aarch64|arm64) ARCH=arm64 ;;
+          *) bail error "unsupported runner architecture $(uname -m); Visiblaze SAST publishes linux/amd64 and linux/arm64" ;;
+        esac
+        if [ "$(uname -s)" != "Linux" ]; then
+          bail error "unsupported runner OS $(uname -s); Visiblaze SAST publishes Linux builds only"
+        fi
+
+        case "$ARCH" in
+          amd64) OPENGREP_URL="${OPENGREP_URL_LINUX_AMD64}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_AMD64}" ;;
+          arm64) OPENGREP_URL="${OPENGREP_URL_LINUX_ARM64}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_ARM64}" ;;
+        esac
+
+        # Fails closed on an unpopulated pin. This is what makes it impossible to ship or run this
+        # action with an unverified dependency: the sentinel is the committed default, so the
+        # action is inert until someone deliberately records a real version and digest.
+        for pair in "OPENGREP_VERSION=${OPENGREP_VERSION}" "SCANNER_VERSION=${SCANNER_VERSION}" \
+                    "SCANNER_BASE_URL=${SCANNER_BASE_URL}" \
+                    "OPENGREP_URL=${OPENGREP_URL}" "OPENGREP_SHA256=${OPENGREP_SHA}"; do
+          if [ "${pair#*=}" = "UNSET" ] || [ -z "${pair#*=}" ]; then
+            bail error "${pair%%=*} is not pinned in pins.env (still UNSET). This action refuses to download an unpinned binary — see the instructions in pins.env."
+          fi
+        done
+
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "$WORK"' EXIT
+
+        # verify_sha256 is the gate every downloaded executable passes before it is made
+        # executable, let alone run. Uses sha256sum where present and shasum otherwise, because
+        # self-hosted runners are not all the GitHub image.
+        verify_sha256() {
+          local file="$1" expected="$2" actual=""
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+          else
+            bail error "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
+          fi
+          # Lowercased both sides: a digest pasted from a release page is often uppercase, and a
+          # case mismatch must not read as tampering.
+          if [ "$(printf '%s' "$actual" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$expected" | tr 'A-Z' 'a-z')" ]; then
+            bail error "checksum mismatch for $(basename "$file") — expected ${expected}, got ${actual}. Nothing was executed. Either the pin is stale or the artefact changed; do not 'fix' this by updating the digest without finding out which."
+          fi
+        }
+
+        # ── Opengrep: the analysis engine ────────────────────────────────────────────────
+        echo "visiblaze-sast: fetching opengrep ${OPENGREP_VERSION} (${ARCH})"
+        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/opengrep" "${OPENGREP_URL}"; then
+          bail error "could not download opengrep from ${OPENGREP_URL}"
+        fi
+        verify_sha256 "${WORK}/opengrep" "${OPENGREP_SHA}"
+
+        # ── Provenance, on top of integrity ──────────────────────────────────────────────
+        #
+        # The digest above proves these bytes are the ones we recorded. It cannot prove we
+        # recorded the right ones: a digest taken from a compromised release is matched
+        # faithfully forever. Opengrep signs each asset with Sigstore keyless signing, so we
+        # also check WHO published it.
+        #
+        # --certificate-identity is not optional. `cosign verify-blob` without it accepts any
+        # valid Sigstore signature, including one an attacker minted for a repository they
+        # control — the signature would verify and mean nothing. Pinning identity and issuer
+        # is what makes this a statement about Opengrep rather than about cryptography.
+        case "${ARCH}" in
+          amd64) COSIGN_URL="${COSIGN_URL_LINUX_AMD64}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_AMD64}" ;;
+          arm64) COSIGN_URL="${COSIGN_URL_LINUX_ARM64}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_ARM64}" ;;
+        esac
+        for pair in "COSIGN_URL=${COSIGN_URL}" "COSIGN_SHA256=${COSIGN_SHA}" \
+                    "OPENGREP_CERT_IDENTITY=${OPENGREP_CERT_IDENTITY}" \
+                    "OPENGREP_CERT_OIDC_ISSUER=${OPENGREP_CERT_OIDC_ISSUER}"; do
+          if [ "${pair#*=}" = "UNSET" ] || [ -z "${pair#*=}" ]; then
+            bail error "${pair%%=*} is not pinned in pins.env. Signature verification cannot be skipped by leaving it blank — fill it in or remove the dependency."
+          fi
+        done
+
+        # NETWORK REQUIREMENT, and it is a real adoption constraint rather than a footnote:
+        # keyless verification consults Sigstore's transparency log at rekor.sigstore.dev. A
+        # runner behind a TLS-intercepting proxy gets the proxy's certificate for that host
+        # and verification fails — observed on an ISP that MITMs it outright. GitHub-hosted
+        # runners are fine. A self-hosted runner inside a corporate network may not be, and
+        # the failure is fail-closed: the action refuses rather than skipping the check. If a
+        # customer hits this, the answer is to allow rekor.sigstore.dev through unintercepted,
+        # never to relax the verification.
+        #
+        # FLAG DEPRECATION: cosign v3 deprecates --certificate/--signature in favour of
+        # --bundle. Opengrep publishes .cert and .sig rather than a bundle, so the deprecated
+        # form is the only one available to us. When bumping COSIGN_VERSION, check these flags
+        # still exist; a major that removes them breaks this step closed, not open.
+        echo "visiblaze-sast: verifying the opengrep signature"
+        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/cosign" "${COSIGN_URL}"; then
+          bail error "could not download cosign from ${COSIGN_URL} — the opengrep signature cannot be checked, so nothing will be executed"
+        fi
+        verify_sha256 "${WORK}/cosign" "${COSIGN_SHA}"
+        chmod +x "${WORK}/cosign"
+
+        # .cert and .sig sit beside the binary, named after it.
+        for ext in cert sig; do
+          if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/opengrep.${ext}" "${OPENGREP_URL}.${ext}"; then
+            bail error "could not download ${OPENGREP_URL}.${ext} — refusing to run an unverified binary"
+          fi
+        done
+        # The published .cert is base64-wrapped PEM; cosign wants the PEM.
+        if ! base64 -d "${WORK}/opengrep.cert" > "${WORK}/opengrep.pem" 2>/dev/null; then
+          cp "${WORK}/opengrep.cert" "${WORK}/opengrep.pem"
+        fi
+
+        if ! "${WORK}/cosign" verify-blob \
+              --certificate "${WORK}/opengrep.pem" \
+              --signature "${WORK}/opengrep.sig" \
+              --certificate-identity "${OPENGREP_CERT_IDENTITY}" \
+              --certificate-oidc-issuer "${OPENGREP_CERT_OIDC_ISSUER}" \
+              "${WORK}/opengrep" >/dev/null 2>&1; then
+          bail error "opengrep signature verification FAILED. The digest matched but the signature did not verify against ${OPENGREP_CERT_IDENTITY}. Either the pinned identity is stale (upstream moved its release workflow) or these are not the bytes upstream published. Do not proceed by relaxing this check; find out which."
+        fi
+        echo "visiblaze-sast: opengrep signature verified (${OPENGREP_CERT_IDENTITY})"
+
+        chmod +x "${WORK}/opengrep"
+
+        # ── The Visiblaze scanner ────────────────────────────────────────────────────────
+        #
+        # Two files from our own release: the archive and the checksums manifest published beside
+        # it. The manifest is fetched from the same pinned tag rather than trusted from anywhere
+        # else, which is why the scanner needs no digest in pins.env — the tag pins both.
+        SCANNER_TGZ="visiblaze-scan_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
+        BASE="${SCANNER_BASE_URL%/}/${SCANNER_VERSION}"
+        echo "visiblaze-sast: fetching scanner ${SCANNER_VERSION} (${ARCH})"
+        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/${SCANNER_TGZ}" "${BASE}/${SCANNER_TGZ}"; then
+          bail error "could not download ${SCANNER_TGZ} from ${BASE}"
+        fi
+        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/checksums.txt" "${BASE}/checksums.txt"; then
+          bail error "could not download checksums.txt from ${BASE} — refusing to run an unverified scanner"
+        fi
+        EXPECTED="$(awk -v f="${SCANNER_TGZ}" '$2 == f || $2 == "*"f {print $1}' "${WORK}/checksums.txt" | head -1)"
+        [ -n "$EXPECTED" ] || bail error "checksums.txt from ${SCANNER_VERSION} does not list ${SCANNER_TGZ}"
+        verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
+
+        if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
+          bail error "could not extract ${SCANNER_TGZ}"
+        fi
+        [ -f "${WORK}/visiblaze-scan" ] || bail error "${SCANNER_TGZ} did not contain visiblaze-scan"
+        chmod +x "${WORK}/visiblaze-scan"
+
+        # ── Identity ─────────────────────────────────────────────────────────────────────
+        #
+        # repo-key defaults to THIS repository's numeric id. The numeric id rather than the name
+        # because a rename keeps the id, and the server joins on it.
+        REPO_KEY="${IN_REPO_KEY}"
+        if [ -z "$REPO_KEY" ]; then
+          [ -n "${GH_REPO_ID}" ] || bail error "could not determine this repository's numeric id; set repo-key explicitly"
+          REPO_KEY="github#${GH_REPO_ID}"
+        fi
+
+        SCAN_DIR="${GITHUB_WORKSPACE}"
+        if [ -n "${IN_PATH}" ] && [ "${IN_PATH}" != "." ]; then
+          SCAN_DIR="${GITHUB_WORKSPACE}/${IN_PATH#./}"
+        fi
+        [ -d "$SCAN_DIR" ] || bail error "path '${IN_PATH}' does not exist in the checkout — did an earlier step forget actions/checkout?"
+
+        ARGS=(
+          --dir "$SCAN_DIR"
+          --repo-key "$REPO_KEY"
+          --tenant "$VISIBLAZE_TENANT"
+          --opengrep "${WORK}/opengrep"
+        )
+        # Scope is left to the scanner to DERIVE from --dir against GITHUB_WORKSPACE unless the
+        # caller overrides it. Deriving beats restating: the job already said what it covers by
+        # choosing a path, and a hand-written scope is a second chance to say it wrong.
+        [ -n "${IN_SCOPE}" ] && ARGS+=(--scope "${IN_SCOPE}")
+        [ -n "${IN_FAIL_ON}" ] && ARGS+=(--fail-on "${IN_FAIL_ON}")
+
+        if [ "${DRY_RUN}" = "true" ]; then
+          ARGS+=(--dry-run)
+        else
+          ARGS+=(--api "$VISIBLAZE_API")
+        fi
+
+        set +e
+        "${WORK}/visiblaze-scan" "${ARGS[@]}"
+        RC=$?
+        set -e
+
+        # Exit codes are distinct on purpose and must not be flattened here. 2 means the code has
+        # a problem the caller asked to block on; 1 means the tool has a problem. A pipeline that
+        # cannot tell those apart learns to ignore both.
+        case "$RC" in
+          0)
+            echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
+            echo "policy=$([ -n "${IN_FAIL_ON}" ] && echo pass || echo not-applied)" >> "$GITHUB_OUTPUT"
+            ;;
+          2)
+            echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
+            echo "policy=fail" >> "$GITHUB_OUTPUT"
+            echo "::error::visiblaze-sast: findings at or above '${IN_FAIL_ON}' are present"
+            exit 2
+            ;;
+          *)
+            bail warning "the scan did not complete (exit ${RC})"
+            ;;
+        esac
