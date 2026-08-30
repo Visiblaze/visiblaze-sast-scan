@@ -114,6 +114,7 @@ outputs:
     value: ${{ steps.scan.outputs.status }}
   policy:
     description: One of pass, fail, not-applied — whether `fail-on` was met.
+    value: ${{ steps.scan.outputs.policy }}
   critical:
     description: Number of critical-severity findings.
     value: ${{ steps.scan.outputs.critical }}
@@ -142,7 +143,6 @@ outputs:
       evidence — do not read an absent finding as a clean result. Distinct from `status`,
       which reports what this ACTION did (sent, dry-run, failed).
     value: ${{ steps.scan.outputs.scan-status }}
-    value: ${{ steps.scan.outputs.policy }}
 
 runs:
   using: composite
