@@ -37,8 +37,16 @@ organisation is authorised. The placeholder above is not a working URL.
 
 ### Recommended first run
 
-Add `dry-run: true`. It scans and prints the exact payload without sending anything, so you can
+Add `dry-run: true`. It scans and prints the exact payload without uploading anything, so you can
 read what would leave your environment before any of it does.
+
+It analyses with the same rules a reporting run would, which means it makes **one** request to
+Visiblaze: an unauthenticated `GET` for the current rule pack. That is the only request a dry run
+makes to us, it carries no credential, and it sends nothing about your code — but it is a request,
+and a preview that used different rules from the real run would not be worth reading.
+
+Leave `api-url` out entirely and the dry run contacts us not at all. It then analyses with the
+rules built into the scanner, and says so.
 
 ```yaml
         with:

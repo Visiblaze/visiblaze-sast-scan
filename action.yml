@@ -114,6 +114,34 @@ outputs:
     value: ${{ steps.scan.outputs.status }}
   policy:
     description: One of pass, fail, not-applied — whether `fail-on` was met.
+  critical:
+    description: Number of critical-severity findings.
+    value: ${{ steps.scan.outputs.critical }}
+  high:
+    description: Number of high-severity findings.
+    value: ${{ steps.scan.outputs.high }}
+  medium:
+    description: Number of medium-severity findings.
+    value: ${{ steps.scan.outputs.medium }}
+  low:
+    description: Number of low-severity findings.
+    value: ${{ steps.scan.outputs.low }}
+  scanner-version:
+    description: >-
+      Version of the Visiblaze scanner that produced this result. Recorded so a change in
+      finding counts can be attributed to a scanner upgrade rather than to your code.
+    value: ${{ steps.scan.outputs.scanner-version }}
+  rules-version:
+    description: >-
+      Version of the Visiblaze rule pack used. Separate from `scanner-version` because rules
+      change far more often than the engine does.
+    value: ${{ steps.scan.outputs.rules-version }}
+  scan-status:
+    description: >-
+      `complete` or `partial`. A partial run's findings are real, but its SILENCE is not
+      evidence — do not read an absent finding as a clean result. Distinct from `status`,
+      which reports what this ACTION did (sent, dry-run, failed).
+    value: ${{ steps.scan.outputs.scan-status }}
     value: ${{ steps.scan.outputs.policy }}
 
 runs:
@@ -329,10 +357,25 @@ runs:
         [ -n "${IN_SCOPE}" ] && ARGS+=(--scope "${IN_SCOPE}")
         [ -n "${IN_FAIL_ON}" ] && ARGS+=(--fail-on "${IN_FAIL_ON}")
 
+        # --api is passed on BOTH paths, and --dry-run alone decides whether anything is
+        # uploaded. The scanner computes `reporting := api != "" && !dryRun`, so "uploads
+        # nothing" is unchanged.
+        #
+        # It is passed on a dry run because the scanner derives the RULE PACK url from it.
+        # Passing it only on a reporting run meant a dry run silently analysed with the rules
+        # compiled into the binary while a real run used the current ones — so the run this
+        # action recommends you read first was previewing a different result from the one you
+        # would get. Every published description of dry-run promises the opposite ("prints
+        # exactly what would be sent"), and that promise was measurably false: the printed
+        # envelope carries rule_pack_version, which differed between the two.
+        #
+        # An evaluator who supplies no api-url still contacts Visiblaze zero times — the
+        # derivation yields nothing to fetch. For everyone else this adds ONE unauthenticated
+        # GET to the rules route; the dry run still mints no token and still authenticates
+        # nowhere.
+        ARGS+=(--api "$VISIBLAZE_API")
         if [ "${DRY_RUN}" = "true" ]; then
           ARGS+=(--dry-run)
-        else
-          ARGS+=(--api "$VISIBLAZE_API")
         fi
 
         set +e
