@@ -88,7 +88,12 @@ Every binary the action executes is version-pinned and SHA-256 verified before i
 | Source-to-sink data flow, as file+line steps within one file | Your secrets, environment, or credentials |
 
 The action reads. It does not write, comment, annotate, or open pull requests. The only effect it
-can have on your pipeline is an exit code, and only if you ask for one with `fail-on`.
+can have on your pipeline is an exit code.
+
+On a pull request it also analyses your merge base, to tell findings this change introduced from
+findings the branch already had. **That second analysis is uploaded nowhere.** It exists only to be
+compared against, inside the same process, on your runner — the results sent to Visiblaze are your
+head commit's, exactly as on a push.
 
 ## There is no secret to configure
 
@@ -106,8 +111,16 @@ endpoint and the action fails with that instruction rather than a confusing 401.
 
 ## Blocking a pull request
 
-`fail-on` exits 2 when a finding at or above that severity is present. Findings are reported either
-way; this only decides whether the job goes red.
+Two separate things can fail a build, they are not interchangeable, and it is worth knowing which
+one stopped you.
+
+### `fail-on` — your own, and it counts everything
+
+`fail-on` exits 2 when a finding at or above that severity is present **anywhere in what was
+scanned**, whether this change introduced it or not. That is a defensible setting for a team that
+wants "no criticals ever, including the ones already there", and it is the wrong setting if you
+expected only new problems to block. Findings are reported either way; this decides only whether the
+job goes red.
 
 ```yaml
         with:
@@ -122,6 +135,30 @@ ignore.
 
 `fail-on-error` (default `false`) controls the second case. The default is deliberate — a scanner
 outage should not be the reason your deploy pipeline goes red.
+
+### Your organisation's policy — new findings only
+
+Your Visiblaze administrator can set a threshold centrally, and that one blocks on findings **this
+change introduced** and never on findings the branch already had. You configure nothing here; the
+action asks for the policy as part of the upload it already makes.
+
+To tell new from inherited, the action scans the merge base as well as your head commit — on a
+pull request, automatically. Nothing is compared on a push, because a push has no proposed change to
+be new relative to.
+
+It costs one extra analysis pass. Not one extra job: the runner, the binaries and their verification
+are already paid for, so on a small repository this is around **+15%** of job time and on one of
+~1,500 files around **+70%**. If you split a monorepo across jobs with `path`, each job scans and
+compares only its own subtree.
+
+Everything about that comparison degrades toward **not blocking**. A shallow checkout we cannot
+deepen, a merge base git cannot resolve, a subtree that did not exist on the base, a baseline scan
+that fails or comes back partial — each of them means no finding can be shown to be new, so none of
+them blocks, and the run says which happened. A repository we cannot build a baseline for does not
+get failing builds because of that.
+
+The two mechanisms do not interact. `fail-on` is yours and lives in this file; the policy is your
+organisation's and lives in Visiblaze. Either can fail a build, and the message names which did.
 
 ## Inputs
 

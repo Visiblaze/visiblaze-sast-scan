@@ -158,6 +158,9 @@ runs:
         IN_FAIL_ON: ${{ inputs.fail-on }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
         DRY_RUN: ${{ inputs.dry-run }}
+        # The pull request's base commit, from the event payload rather than an API call. Empty on
+        # a push, which is correct: a push has no proposed change to be new relative to.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
         GH_REPO_ID: ${{ github.event.repository.id }}
         GH_REPOSITORY: ${{ github.repository }}
         ACTION_DIR: ${{ github.action_path }}
@@ -376,6 +379,62 @@ runs:
         ARGS+=(--api "$VISIBLAZE_API")
         if [ "${DRY_RUN}" = "true" ]; then
           ARGS+=(--dry-run)
+        fi
+
+        # ── The baseline, on a pull request ──────────────────────────────────────────────
+        #
+        # Scanning the merge base as well as the head is what lets a finding be called NEW, and
+        # therefore what lets your organisation's policy block on what this change introduced
+        # rather than on everything the branch already had.
+        #
+        # Every failure below is NON-FATAL and lands in the same place: no baseline, so nothing
+        # is called new, so nothing blocks. That is deliberate. A repository we cannot build a
+        # baseline for must not have its builds fail over our inability to build one.
+        #
+        # The awkward part is history. Your checkout is usually shallow -- actions/checkout
+        # defaults to fetch-depth 1 -- and a merge base cannot be computed from one commit. We
+        # deepen it ourselves rather than asking you to change your checkout, because a scanner
+        # that requires fetch-depth: 0 to work is a scanner that silently does less for everyone
+        # who did not read that far.
+        # Only ask for a baseline if the PINNED scanner understands it. action.yml and pins.env
+        # are two files that move independently, and the scanner rejects an unknown flag outright
+        # -- so an action newer than its pin would fail every pull request with
+        # "flag provided but not defined". Checking costs one --help and removes the ordering
+        # constraint entirely: this file can ship before or after the scanner release, in either
+        # order, and a customer pinned to an older scanner simply gets no baseline.
+        SUPPORTS_BASELINE=""
+        if "${WORK}/visiblaze-scan" --help 2>&1 | grep -q -- "-base-dir"; then
+          SUPPORTS_BASELINE="yes"
+        fi
+
+        if [ -n "${BASE_SHA}" ] && [ "${DRY_RUN}" != "true" ] && [ -n "${SUPPORTS_BASELINE}" ]; then
+          BASE_WORKTREE="${WORK}/base"
+          if git -C "${GITHUB_WORKSPACE}" rev-parse --git-dir >/dev/null 2>&1; then
+            git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --depth=100 origin "${BASE_SHA}" 2>/dev/null \
+              || git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet origin "${BASE_SHA}" 2>/dev/null || true
+            MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" merge-base HEAD "${BASE_SHA}" 2>/dev/null || true)"
+            if [ -n "${MERGE_BASE}" ] \
+               && git -C "${GITHUB_WORKSPACE}" worktree add --detach --quiet "${BASE_WORKTREE}" "${MERGE_BASE}" 2>/dev/null; then
+              # The baseline must be the SAME SUBTREE, or a monorepo job comparing its package
+              # against the whole repository would call every finding outside its package "new"
+              # and then block on them. SCAN_DIR is under the workspace, so its suffix maps
+              # directly onto the worktree.
+              BASE_SCAN_DIR="${BASE_WORKTREE}${SCAN_DIR#${GITHUB_WORKSPACE}}"
+              if [ -d "${BASE_SCAN_DIR}" ]; then
+                echo "visiblaze-sast: comparing against merge base ${MERGE_BASE}"
+                ARGS+=(--base-dir "${BASE_SCAN_DIR}")
+              else
+                # The path did not exist on the base -- a newly added package. Everything in it is
+                # genuinely new, but saying so with an empty baseline would be a guess dressed as
+                # a measurement, so this reports and does not block.
+                echo "visiblaze-sast: '${IN_PATH}' does not exist at the merge base, so this is a new subtree; nothing will block"
+              fi
+            else
+              echo "visiblaze-sast: could not resolve a merge base, so no finding can be shown to be new; nothing will block"
+            fi
+          else
+            echo "visiblaze-sast: no git history available, so no finding can be shown to be new; nothing will block"
+          fi
         fi
 
         set +e
