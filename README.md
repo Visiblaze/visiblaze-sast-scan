@@ -192,8 +192,14 @@ SHA-256 verified **before** execution — a mismatch aborts and runs nothing.
 There is no `latest` anywhere. A floating dependency inside a pinned action would mean the SHA you
 pinned does not actually determine what runs on your machine.
 
-The action is a composite shell script, not a Docker image, so you can read exactly what it does
-before you run it.
+The action is a composite shell script, not a Docker image, so you can read the whole wrapper
+before you run it: which binaries it downloads, which digests it demands, where it is permitted to
+send findings, and what it passes to the scanner.
+
+The scanner itself is a compiled binary and its source is not in this repository, so "read
+everything it does" would be an overstatement. What you can verify instead is which bytes run: the
+archive's SHA-256 is committed in `pins.env`, so the action SHA you pin determines the scanner that
+executes, and changing it is a visible diff in this repository.
 
 ## Advanced: monorepos, one job per package
 

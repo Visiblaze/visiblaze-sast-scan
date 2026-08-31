@@ -93,6 +93,23 @@ inputs:
       Findings are still reported when this is empty.
     required: false
     default: ""
+  mode:
+    description: >-
+      `advisory` (default) or `gate`.
+
+      In ADVISORY mode a broken scan is reported and the job still succeeds: a scanner outage must
+      not be the reason a deploy pipeline goes red, and this is the right default for a check
+      nobody is gating on yet.
+
+      In GATE mode a broken scan FAILS the job. Use it wherever this check is required in branch
+      protection, because there the two states are not equivalent: no SAST result is not a SAST
+      pass, and a check that goes green when the scanner crashed is worse than no check at all -
+      it asserts something.
+
+      An unrecognised value is refused rather than treated as advisory, so a typo cannot silently
+      downgrade a gate.
+    required: false
+    default: advisory
   fail-on-error:
     description: >-
       Fail the job if the scan or the upload itself fails. Default false: a scanner outage must not
@@ -157,6 +174,7 @@ runs:
         IN_SCOPE: ${{ inputs.scope }}
         IN_FAIL_ON: ${{ inputs.fail-on }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        IN_MODE: ${{ inputs.mode }}
         DRY_RUN: ${{ inputs.dry-run }}
         # The pull request's base commit, from the event payload rather than an API call. Empty on
         # a push, which is correct: a push has no proposed change to be new relative to.
@@ -172,11 +190,30 @@ runs:
 
         # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
         # rather than buried in a trailing `|| true`.
+        # Resolved before anything can fail, because bail() consults it.
+        #
+        # An unknown value is a hard error rather than a fallback to advisory. Falling back would
+        # mean `mode: Gate`, `mode: blocking` or `mode: gated` silently produce a check that
+        # cannot fail - the exact outcome the person writing that line was trying to prevent, and
+        # invisible to them because the job goes green either way.
+        case "${IN_MODE:-advisory}" in
+          advisory) FAIL_CLOSED="false" ;;
+          gate)     FAIL_CLOSED="true" ;;
+          *)
+            echo "::error::visiblaze-sast: mode must be 'advisory' or 'gate', got '${IN_MODE}'"
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            exit 1
+            ;;
+        esac
+        # fail-on-error predates mode and still works on its own, so an existing workflow that set
+        # it keeps the behaviour it asked for. Either switch failing closed is enough.
+        if [ "${FAIL_ON_ERROR}" = "true" ]; then FAIL_CLOSED="true"; fi
+
         bail() {
           local level="$1"; shift
           echo "::${level}::visiblaze-sast: $*"
           echo "status=failed" >> "$GITHUB_OUTPUT"
-          if [ "${FAIL_ON_ERROR}" = "true" ]; then exit 1; fi
+          if [ "${FAIL_CLOSED}" = "true" ]; then exit 1; fi
           exit 0
         }
 
@@ -322,11 +359,22 @@ runs:
         if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/${SCANNER_TGZ}" "${BASE}/${SCANNER_TGZ}"; then
           bail error "could not download ${SCANNER_TGZ} from ${BASE}"
         fi
-        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/checksums.txt" "${BASE}/checksums.txt"; then
-          bail error "could not download checksums.txt from ${BASE} — refusing to run an unverified scanner"
-        fi
-        EXPECTED="$(awk -v f="${SCANNER_TGZ}" '$2 == f || $2 == "*"f {print $1}' "${WORK}/checksums.txt" | head -1)"
-        [ -n "$EXPECTED" ] || bail error "checksums.txt from ${SCANNER_VERSION} does not list ${SCANNER_TGZ}"
+        # The digest comes from pins.env, NOT from the release.
+        #
+        # It used to be read out of the release's own checksums.txt, which defends against a
+        # corrupted download and not against a compromised release: whoever can replace the
+        # archive can replace the file that vouches for it. Committing the digest here moves the
+        # trust anchor into the action commit, so a pinned action SHA really does determine the
+        # bytes that execute - which is what the README claims.
+        case "${ARCH}" in
+          amd64) EXPECTED="${SCANNER_SHA256_LINUX_AMD64:-}" ;;
+          arm64) EXPECTED="${SCANNER_SHA256_LINUX_ARM64:-}" ;;
+          *)     EXPECTED="" ;;
+        esac
+        # Refused rather than falling back to the release's checksums.txt. A missing pin is the
+        # one condition under which a fallback would silently restore exactly the weakness this
+        # replaced, on a run that otherwise looks identical.
+        [ -n "$EXPECTED" ] || bail error "pins.env carries no scanner digest for ${ARCH} — refusing to run a scanner this action commit does not pin"
         verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
 
         if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
@@ -409,6 +457,29 @@ runs:
         # derivation yields nothing to fetch. For everyone else this adds ONE unauthenticated
         # GET to the rules route; the dry run still mints no token and still authenticates
         # nowhere.
+        # ── Where findings may be sent ───────────────────────────────────────────────────
+        #
+        # Checked HERE, in the wrapper anyone can read, rather than left to the compiled scanner.
+        # The guarantee worth being able to make is "this action can only send findings to a
+        # Visiblaze origin", and a guarantee that lives inside a binary is one a reviewer has to
+        # take on trust - which is the whole objection to a closed-source scanner.
+        #
+        # The allowlist is in pins.env, so it moves with the action SHA a customer pinned: adding
+        # an origin is a visible diff in the same commit that changes what may execute.
+        API_ORIGIN="$(printf '%s' "$VISIBLAZE_API" | awk -F/ '{print $1"//"$3}')"
+        case "$VISIBLAZE_API" in
+          https://*) ;;
+          *) bail error "api-url must be https, got '${VISIBLAZE_API}'" ;;
+        esac
+        API_OK=""
+        for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
+          if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
+        done
+        # No allowlist at all is refused rather than treated as "anything goes". An empty variable
+        # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
+        # turn a broken file into a silent removal of this check.
+        [ -n "$API_OK" ] || bail error "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+
         ARGS+=(--api "$VISIBLAZE_API")
         if [ "${DRY_RUN}" = "true" ]; then
           ARGS+=(--dry-run)
