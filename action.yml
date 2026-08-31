@@ -351,6 +351,23 @@ runs:
         fi
         [ -d "$SCAN_DIR" ] || bail error "path '${IN_PATH}' does not exist in the checkout — did an earlier step forget actions/checkout?"
 
+        # The scan must stay inside the checkout, and string-building the path does not ensure it.
+        # `path: ../..` produces a directory that exists and is somebody else's — on a hosted runner
+        # that is the runner's own workspace root, and on a SELF-HOSTED runner it is whatever else
+        # that machine happens to hold, including other tenants' checkouts and credentials.
+        #
+        # Compared after resolution, so a symlink inside the checkout pointing outward is caught by
+        # the same test as `..`. Both operands are canonicalised: comparing a resolved path against
+        # an unresolved one fails on any runner whose workspace sits under a symlink, which is the
+        # default on macOS.
+        WORKSPACE_REAL="$(cd "${GITHUB_WORKSPACE}" 2>/dev/null && pwd -P)" || bail error "could not resolve GITHUB_WORKSPACE"
+        SCAN_REAL="$(cd "${SCAN_DIR}" 2>/dev/null && pwd -P)" || bail error "could not resolve path '${IN_PATH}'"
+        case "${SCAN_REAL}" in
+          "${WORKSPACE_REAL}"|"${WORKSPACE_REAL}"/*) ;;
+          *) bail error "path '${IN_PATH}' resolves to ${SCAN_REAL}, which is outside the checkout — refusing to read files this workflow did not check out" ;;
+        esac
+        SCAN_DIR="${SCAN_REAL}"
+
         ARGS=(
           --dir "$SCAN_DIR"
           --repo-key "$REPO_KEY"
@@ -360,7 +377,20 @@ runs:
         # Scope is left to the scanner to DERIVE from --dir against GITHUB_WORKSPACE unless the
         # caller overrides it. Deriving beats restating: the job already said what it covers by
         # choosing a path, and a hand-written scope is a second chance to say it wrong.
-        [ -n "${IN_SCOPE}" ] && ARGS+=(--scope "${IN_SCOPE}")
+        if [ -n "${IN_SCOPE}" ]; then
+          # Scope is a comma-separated list of repo-relative directories. It is a DECLARATION of
+          # coverage rather than a path the action opens, but it reaches the platform and decides
+          # which stored findings a run may resolve — so an entry escaping the repository would let
+          # a run claim coverage it never had, and resolve findings it never looked at.
+          OLD_IFS="$IFS"; IFS=','
+          for entry in ${IN_SCOPE}; do
+            case "${entry}" in
+              /*|*..*) IFS="$OLD_IFS"; bail error "scope entry '${entry}' must be a relative path inside the repository" ;;
+            esac
+          done
+          IFS="$OLD_IFS"
+          ARGS+=(--scope "${IN_SCOPE}")
+        fi
         [ -n "${IN_FAIL_ON}" ] && ARGS+=(--fail-on "${IN_FAIL_ON}")
 
         # --api is passed on BOTH paths, and --dry-run alone decides whether anything is
