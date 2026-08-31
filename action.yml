@@ -93,6 +93,20 @@ inputs:
       Findings are still reported when this is empty.
     required: false
     default: ""
+  rules-version:
+    description: >-
+      Pin the rule pack to an exact version, e.g. `v0.1.0`. Leave empty (the default) to use
+      whatever Visiblaze currently serves.
+
+      Unpinned, the same commit can produce different findings on different days as the rule pack
+      improves. That is usually what you want; it is not what you want for a check that gates
+      merges, where a verdict should be reproducible.
+
+      Pinned, the scanner refuses to run if that version cannot be served. It will not quietly fall
+      back to the rules built into the binary, because a pin whose failure mode is "ran different
+      rules and said nothing" is not a pin.
+    required: false
+    default: ""
   mode:
     description: >-
       `advisory` (default) or `gate`.
@@ -175,6 +189,7 @@ runs:
         IN_FAIL_ON: ${{ inputs.fail-on }}
         FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
         IN_MODE: ${{ inputs.mode }}
+        IN_RULES_VERSION: ${{ inputs.rules-version }}
         DRY_RUN: ${{ inputs.dry-run }}
         # The pull request's base commit, from the event payload rather than an API call. Empty on
         # a push, which is correct: a push has no proposed change to be new relative to.
@@ -479,6 +494,8 @@ runs:
         # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
         # turn a broken file into a silent removal of this check.
         [ -n "$API_OK" ] || bail error "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+
+        [ -n "${IN_RULES_VERSION}" ] && ARGS+=(--rules-version "${IN_RULES_VERSION}")
 
         ARGS+=(--api "$VISIBLAZE_API")
         if [ "${DRY_RUN}" = "true" ]; then
