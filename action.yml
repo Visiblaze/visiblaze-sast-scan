@@ -161,6 +161,9 @@ runs:
         # The pull request's base commit, from the event payload rather than an API call. Empty on
         # a push, which is correct: a push has no proposed change to be new relative to.
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        # The base BRANCH, as a fallback fetch target: some servers refuse to serve an arbitrary
+        # commit but will serve the ref it sits on.
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
         GH_REPO_ID: ${{ github.event.repository.id }}
         GH_REPOSITORY: ${{ github.repository }}
         ACTION_DIR: ${{ github.action_path }}
@@ -410,9 +413,36 @@ runs:
         if [ -n "${BASE_SHA}" ] && [ "${DRY_RUN}" != "true" ] && [ -n "${SUPPORTS_BASELINE}" ]; then
           BASE_WORKTREE="${WORK}/base"
           if git -C "${GITHUB_WORKSPACE}" rev-parse --git-dir >/dev/null 2>&1; then
-            git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --depth=100 origin "${BASE_SHA}" 2>/dev/null \
-              || git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet origin "${BASE_SHA}" 2>/dev/null || true
-            MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" merge-base HEAD "${BASE_SHA}" 2>/dev/null || true)"
+            # A pull-request checkout is shallow by default -- actions/checkout uses fetch-depth 1 --
+            # and a merge base cannot be computed from one commit on each side. Deepen first, then
+            # ask. Each step's error is CAPTURED rather than discarded: the first version of this
+            # sent stderr to /dev/null and reported only "could not resolve a merge base", which
+            # said nothing about which of four different causes it was.
+            GITERR=""
+            if ! git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
+                   origin "+${BASE_SHA}:refs/visiblaze/base" 2>"${WORK}/git.err"; then
+              GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
+              # A server that will not serve an arbitrary SHA still serves the branch it is on.
+              if ! git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
+                     origin "${BASE_REF}" 2>"${WORK}/git.err"; then
+                GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
+              else
+                GITERR=""
+              fi
+            fi
+            # Deepen the HEAD side too, or the two histories still never meet.
+            git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --deepen=200 2>/dev/null || true
+
+            MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" merge-base HEAD "${BASE_SHA}" 2>"${WORK}/git.err" || true)"
+            if [ -z "${MERGE_BASE}" ]; then
+              # On a pull_request event HEAD is refs/pull/N/merge, whose FIRST parent is the base
+              # side of that merge. Weaker than a true merge base -- it can call a finding new that
+              # was fixed on the base since this branch was cut -- so it is a fallback, not the
+              # primary, and it is only reached when the histories genuinely will not meet.
+              MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify --quiet 'HEAD^1' 2>/dev/null || true)"
+              [ -n "${MERGE_BASE}" ] && echo "visiblaze-sast: no common history with the base; comparing against the merge commit's base parent instead"
+            fi
+            [ -z "${MERGE_BASE}" ] && [ -z "${GITERR}" ] && GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
             if [ -n "${MERGE_BASE}" ] \
                && git -C "${GITHUB_WORKSPACE}" worktree add --detach --quiet "${BASE_WORKTREE}" "${MERGE_BASE}" 2>/dev/null; then
               # The baseline must be the SAME SUBTREE, or a monorepo job comparing its package
@@ -430,7 +460,7 @@ runs:
                 echo "visiblaze-sast: '${IN_PATH}' does not exist at the merge base, so this is a new subtree; nothing will block"
               fi
             else
-              echo "visiblaze-sast: could not resolve a merge base, so no finding can be shown to be new; nothing will block"
+              echo "visiblaze-sast: could not resolve a merge base, so no finding can be shown to be new; nothing will block${GITERR:+ (git: ${GITERR})}"
             fi
           else
             echo "visiblaze-sast: no git history available, so no finding can be shown to be new; nothing will block"
