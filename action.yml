@@ -194,6 +194,10 @@ runs:
         # The pull request's base commit, from the event payload rather than an API call. Empty on
         # a push, which is correct: a push has no proposed change to be new relative to.
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        # The PULL REQUEST's own head commit, which is NOT the checked-out HEAD: on a
+        # pull_request event the workspace is at refs/pull/N/merge. Needed to compute a real
+        # merge base -- see the merge-base step below.
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # The base BRANCH, as a fallback fetch target: some servers refuse to serve an arbitrary
         # commit but will serve the ref it sits on.
         BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -551,10 +555,28 @@ runs:
             # Deepen the HEAD side too, or the two histories still never meet.
             git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --deepen=200 2>/dev/null || true
 
-            MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" merge-base HEAD "${BASE_SHA}" 2>"${WORK}/git.err" || true)"
+            # Merge-base the PULL REQUEST'S HEAD against the base tip, never the checked-out HEAD.
+            #
+            # On a pull_request event the workspace is at refs/pull/N/merge, and the base tip is that
+            # merge commit's FIRST PARENT -- so `merge-base HEAD "${BASE_SHA}"` returns BASE_SHA
+            # itself. Not an error, just the wrong commit: the base branch TIP rather than the fork
+            # point. That attributes to this pull request everything that landed on the base branch
+            # since it was cut, and, now that the baseline is published, stores it under a sha the
+            # platform never reads -- it looks the base side up at GitHub's own merge base of
+            # (base tip, pull request head).
+            #
+            # HEAD^2 is the pull request's head on a merge-ref checkout and needs no fetch, so it is
+            # the fallback when the event payload is absent (a manual or non-GitHub run).
+            MB_HEAD="${PR_HEAD_SHA:-}"
+            [ -z "${MB_HEAD}" ] && MB_HEAD="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify --quiet 'HEAD^2' 2>/dev/null || true)"
+            [ -z "${MB_HEAD}" ] && MB_HEAD="HEAD"
+            MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" merge-base "${MB_HEAD}" "${BASE_SHA}" 2>"${WORK}/git.err" || true)"
             if [ -z "${MERGE_BASE}" ]; then
               # On a pull_request event HEAD is refs/pull/N/merge, whose FIRST parent is the base
               # side of that merge. Weaker than a true merge base -- it can call a finding new that
+              # A baseline published from this fallback is stored at the base TIP, which is not where
+              # the platform reads the base side from, so the check reports no baseline even though
+              # classification still works locally.
               # was fixed on the base since this branch was cut -- so it is a fallback, not the
               # primary, and it is only reached when the histories genuinely will not meet.
               MERGE_BASE="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify --quiet 'HEAD^1' 2>/dev/null || true)"
