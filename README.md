@@ -12,8 +12,9 @@ leaves your environment.**
 ```yaml
 name: Security
 on:
+  pull_request:          # where a finding is cheapest to fix
   push:
-    branches: [main]
+    branches: [main]     # the authoritative record of what is on your default branch
 
 jobs:
   sast:
@@ -23,11 +24,22 @@ jobs:
       id-token: write        # required — this is how the action authenticates
     steps:
       - uses: actions/checkout@v4
+        with:
+          # A pull-request checkout is one commit deep by default, and the merge base cannot be
+          # computed from one commit. Without history the scan still runs, but every finding looks
+          # new - including the ones that were already on your default branch.
+          fetch-depth: 0
       - uses: Visiblaze/visiblaze-sast-scan@<commit-sha>
         with:
           tenant: your-tenant-id
           api-url: https://<your-visiblaze-ingest-endpoint>/v1/code/findings
 ```
+
+Both triggers, deliberately. The pull-request run is the one that matters to a developer: it compares
+against the merge base, so it can tell a finding **this change introduced** from one that was already
+there — which is what makes a gate survivable on a repository that starts with existing findings.
+The push run keeps the record of your default branch honest, because that is the branch people
+actually ship.
 
 Pin a **commit SHA**, not a tag. A tag can be moved to point at different code; a SHA cannot. The
 same property means a scanner update reaches you when you re-pin — not before.
