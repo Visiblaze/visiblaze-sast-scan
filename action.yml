@@ -601,7 +601,21 @@ runs:
           2)
             echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
             echo "policy=fail" >> "$GITHUB_OUTPUT"
-            echo "::error::visiblaze-sast: findings at or above '${IN_FAIL_ON}' are present"
+            # Exit 2 has two causes and they are not interchangeable: the caller's own --fail-on
+            # threshold, and the tenant policy the platform sends back with the ingest response.
+            # Which one fired is knowable here without asking the scanner, because --fail-on is
+            # only ever passed when IN_FAIL_ON is set - so an empty threshold at exit 2 can only
+            # be the policy.
+            #
+            # This mattered more than a wording nit. `::error::` is what GitHub surfaces on the
+            # pull request, so when the policy blocked, the ONLY message a reviewer saw was
+            # "findings at or above '' are present" - an empty threshold, attributed to the
+            # wrong decision-maker - while the scanner's accurate sentence stayed in the log.
+            if [ -n "${IN_FAIL_ON}" ]; then
+              echo "::error::visiblaze-sast: findings at or above '${IN_FAIL_ON}' are present"
+            else
+              echo "::error::visiblaze-sast: this change introduced findings your organisation's pull-request policy blocks on - the run log names them and says which are new"
+            fi
             exit 2
             ;;
           *)
