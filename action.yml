@@ -542,10 +542,24 @@ runs:
         # "flag provided but not defined". Checking costs one --help and removes the ordering
         # constraint entirely: this file can ship before or after the scanner release, in either
         # order, and a customer pinned to an older scanner simply gets no baseline.
+        #
+        # Captured, not piped. `cmd --help | grep -q` looks equivalent and is not: grep -q exits at
+        # the FIRST match, the binary keeps writing into a closed pipe and takes SIGPIPE, and
+        # `set -o pipefail` above turns that into a FAILED pipeline even though grep matched.
+        # SUPPORTS_BASELINE then stays empty, the entire baseline block is skipped, and the check
+        # reports "no baseline, nothing was compared" on a run that should have had one. No error
+        # is printed anywhere.
+        #
+        # MEASURED with the real scanner under bash 5.3 + BSD grep: the pipeline returns 141
+        # (SIGPIPE) and detection succeeds 7 times in 200. GNU grep on the Linux runners has been
+        # getting away with it — every baseline run today detected both flags — so this is latent
+        # there and active anywhere else, which is the worst version: it works until it does not,
+        # and its failure is silent and looks like a clean comparison.
         SUPPORTS_BASELINE=""
-        if "${WORK}/visiblaze-scan" --help 2>&1 | grep -q -- "-base-dir"; then
-          SUPPORTS_BASELINE="yes"
-        fi
+        HELP_OUT="$("${WORK}/visiblaze-scan" --help 2>&1 || true)"
+        case "$HELP_OUT" in
+          *-base-dir*) SUPPORTS_BASELINE="yes" ;;
+        esac
 
         if [ -n "${BASE_SHA}" ] && [ "${DRY_RUN}" != "true" ] && [ -n "${SUPPORTS_BASELINE}" ]; then
           BASE_WORKTREE="${WORK}/base"
@@ -616,12 +630,18 @@ runs:
                 # Feature-detected separately from --base-dir: the two flags shipped in different
                 # scanner releases, so a pin between them understands one and rejects the other,
                 # and an unknown flag fails the whole run.
-                if "${WORK}/visiblaze-scan" --help 2>&1 | grep -q -- "-base-sha"; then
-                  ARGS+=(--base-sha "${MERGE_BASE}")
-                  [ -n "${BASE_REF}" ] && ARGS+=(--base-ref "${BASE_REF}")
-                else
-                  echo "visiblaze-sast: this scanner cannot publish the baseline, so the check will compare nothing. Re-pin to a newer scanner."
-                fi
+                # Same capture-then-match as the --base-dir probe above, and it matters more here: if
+                # --base-dir is detected and --base-sha is not, the scanner compares locally and publishes
+                # NOTHING, which is precisely the "no baseline" outcome the publication work removed.
+                case "$HELP_OUT" in
+                  *-base-sha*)
+                    ARGS+=(--base-sha "${MERGE_BASE}")
+                    [ -n "${BASE_REF}" ] && ARGS+=(--base-ref "${BASE_REF}")
+                    ;;
+                  *)
+                    echo "visiblaze-sast: this scanner cannot publish the baseline, so the check will compare nothing. Re-pin to a newer scanner."
+                    ;;
+                esac
               else
                 # The path did not exist on the base -- a newly added package. Everything in it is
                 # genuinely new, but saying so with an empty baseline would be a guess dressed as
@@ -647,11 +667,13 @@ runs:
         case "$RC" in
           0)
             echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
-            echo "policy=$([ -n "${IN_FAIL_ON}" ] && echo pass || echo not-applied)" >> "$GITHUB_OUTPUT"
+            # `policy` is written by the SCANNER, which knows which policy decided. This line used to
+            # compute it from --fail-on alone, so a tenant whose ORG policy ran and PASSED was reported
+            # as not-applied and a workflow gating on pass could never see one.
             ;;
           2)
             echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
-            echo "policy=fail" >> "$GITHUB_OUTPUT"
+            # `policy=fail` likewise comes from the scanner, which knows WHICH policy failed.
             # Exit 2 has two causes and they are not interchangeable: the caller's own --fail-on
             # threshold, and the tenant policy the platform sends back with the ingest response.
             # Which one fired is knowable here without asking the scanner, because --fail-on is

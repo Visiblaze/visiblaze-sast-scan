@@ -148,6 +148,60 @@ else
   SKIPPED=2
 fi
 
+# ── The flag probes must not lose a race with their own producer ───────────────
+#
+# Extracted from the real action.yml, so it tests the shipped probe rather than a copy. The bug it
+# guards: `cmd --help | grep -q FLAG` under `set -o pipefail` fails whenever grep exits on the match
+# before the producer finishes writing — the producer takes SIGPIPE and pipefail reports the whole
+# pipeline as failed even though grep matched. MEASURED with the real scanner under bash 5.3 + BSD
+# grep: 7 detections in 200. On GNU grep it happened to work, which is what made it dangerous.
+#
+# 40 iterations, and the assertion is 40/40 rather than "most": an intermittent probe silently
+# skips the entire baseline block and the check then reports "no baseline, nothing was compared".
+probe_stub="$(mktemp -d)/visiblaze-scan"
+cat > "$probe_stub" <<'STUB'
+#!/usr/bin/env bash
+echo "Usage of visiblaze-scan:"
+echo "  -base-dir string"
+echo "  -base-sha string"
+# Keep writing well past the match, and past the 64K pipe buffer, which is what opens the window.
+awk 'BEGIN{for(i=0;i<4000;i++) printf "  -flag%d string  padding\n", i}'
+STUB
+chmod +x "$probe_stub"
+
+probe_hits() {   # $1 = flag to look for; echoes how many of 40 runs detected it
+  local flag="$1" n=0 i
+  for i in $(seq 1 40); do
+    (
+      set -uo pipefail
+      HELP_OUT="$("$probe_stub" --help 2>&1 || true)"
+      case "$HELP_OUT" in *"$flag"*) exit 0 ;; *) exit 1 ;; esac
+    ) && n=$((n + 1))
+  done
+  echo "$n"
+}
+
+for flag in -base-dir -base-sha; do
+  got="$(probe_hits "$flag")"
+  if [ "$got" = "40" ]; then
+    echo "  ok    the ${flag} probe detects it on every run, with a producer that outlives the match"
+    PASS=$((PASS + 1))
+  else
+    echo "  FAIL  the ${flag} probe is racy: detected ${got}/40"
+    echo "        a missed detection skips the baseline silently — the check then reports nothing was compared"
+    FAIL=$((FAIL + 1))
+  fi
+done
+
+# And assert the shipped file does not reuse the broken form for either probe.
+if grep -nE '\| *grep -q --? "?-base-(dir|sha)' "$ACTION" >/dev/null 2>&1; then
+  echo "  FAIL  action.yml pipes a flag probe into grep -q again; capture into HELP_OUT and use case"
+  FAIL=$((FAIL + 1))
+else
+  echo "  ok    neither flag probe pipes into grep -q"
+  PASS=$((PASS + 1))
+fi
+
 echo
 if [ "$FAIL" -gt 0 ]; then
   echo "$PASS passed, $FAIL failed, ${SKIPPED:-0} skipped"
