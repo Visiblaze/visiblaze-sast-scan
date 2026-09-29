@@ -141,8 +141,26 @@ outputs:
     description: Number of findings reported.
     value: ${{ steps.scan.outputs.findings }}
   status:
-    description: One of sent, dry-run, failed.
+    description: >-
+      One of sent, dry-run, failed.
+
+      Kept exactly as it has always been, because workflows branch on it today. It is NOT
+      comparable across the Visiblaze actions: `visiblaze-secret-scan` spells the same idea
+      `complete`. Use `delivery-status` for anything that has to read the same on every step.
     value: ${{ steps.scan.outputs.status }}
+  delivery-status:
+    description: >-
+      The SAME question as `status` — did this run deliver its result — in the vocabulary every
+      Visiblaze action answers it in, so one `if:` expression works across all of them.
+
+      `sent` | `dry-run` | `failed`, plus `partial` from actions that can deliver part of a run
+      (this one cannot; it is listed so a consumer matching the full set does not have to be
+      rewritten when another step in the same workflow emits it).
+
+      For THIS action the value is identical to `status` on every path. It exists so a workflow
+      never has to know which action it is reading: `status` means `sent` here and `complete` in
+      the secret scanner, and that divergence is frozen rather than fixed.
+    value: ${{ steps.scan.outputs.delivery-status }}
   policy:
     description: One of pass, fail, not-applied — whether `fail-on` was met.
     value: ${{ steps.scan.outputs.policy }}
@@ -222,6 +240,35 @@ runs:
       run: |
         set -uo pipefail
 
+        # ── Booleans, validated ──
+        #
+        # Ported from the secret-scan action, which grew this helper after the defect was found
+        # there first. This file had the identical bug: `dry-run` and `fail-on-error` were exact
+        # compares against lowercase `true` with no else-branch, so `dry-run: 'True'` — a plausible
+        # YAML capital, and `yes` and `1` behave the same way — fell through to the REPORTING path
+        # and performed a REAL UPLOAD while the author believed nothing left their network. On the
+        # run this action's own README tells you to do first, precisely so you can see what leaves.
+        #
+        # Anything not clearly true or false is REFUSED rather than guessed, `fail-on-error`
+        # included. Guessing `false` for an unreadable value is the same silent downgrade the mode
+        # gate below refuses for the same reason: the person who wrote that line was asking for a
+        # guarantee, and quietly not giving them one is worse than telling them the value is junk.
+        norm_bool() {
+          case "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" in
+            true|yes|1|on)     printf 'true'  ;;
+            false|no|0|off|"") printf 'false' ;;
+            *) echo "::error::visiblaze-sast: ${1} must be true or false, got '${2}'" >&2
+               printf 'invalid' ;;
+          esac
+        }
+        DRY_RUN="$(norm_bool dry-run "${DRY_RUN:-}")"
+        FAIL_ON_ERROR="$(norm_bool fail-on-error "${FAIL_ON_ERROR:-}")"
+        if [ "$DRY_RUN" = "invalid" ] || [ "$FAIL_ON_ERROR" = "invalid" ]; then
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
         # Soft failure unless the caller opted in. Two exit paths so the intent is explicit
         # rather than buried in a trailing `|| true`.
         # Resolved before anything can fail, because bail() consults it.
@@ -236,6 +283,7 @@ runs:
           *)
             echo "::error::visiblaze-sast: mode must be 'advisory' or 'gate', got '${IN_MODE}'"
             echo "status=failed" >> "$GITHUB_OUTPUT"
+            echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
             exit 1
             ;;
         esac
@@ -247,8 +295,38 @@ runs:
           local level="$1"; shift
           echo "::${level}::visiblaze-sast: $*"
           echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
           if [ "${FAIL_CLOSED}" = "true" ]; then exit 1; fi
           exit 0
+        }
+
+        # fatal() is for INTEGRITY failures, and it ignores BOTH `mode` and `fail-on-error`.
+        #
+        # Ported from the secret-scan action, where the same gap was found and closed first. The
+        # README above this file promises "both have their SHA-256 checked BEFORE execution; a
+        # mismatch aborts and runs nothing". The first half was true and the second half was not:
+        # a checksum mismatch went through bail(), which on the DOCUMENTED DEFAULTS
+        # (mode: advisory, fail-on-error: false) prints an annotation and exits 0. The tampered
+        # bytes were indeed never executed — but the job went green, so a substituted artefact was
+        # indistinguishable downstream from a scan that found nothing.
+        #
+        # The line is availability versus integrity. A download that will not download, an
+        # endpoint that is down, an architecture we do not publish for: ours, transient, and must
+        # not redden your pipeline — that is bail(). A tampered artefact, a signature that does not
+        # verify, a pin we cannot verify at all, an api-url we do not permit, or a declared
+        # coverage that escapes your repository: none are transient, and continuing quietly on any
+        # of them is worse than failing.
+        #
+        # Deliberately NOT fatal, and the distinction is the reason `path` is not on the list: a
+        # `path:` that no longer exists in the checkout is a stale workflow, not a compromised one,
+        # and reddening a build over it buys no safety. It stays a bail(). The secret-scan action
+        # makes that one fatal because its path resolution cannot separate "missing" from
+        # "outside"; this one can, so it does.
+        fatal() {
+          echo "::error::visiblaze-sast: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
         }
 
         # ── The pin, and the refusal to run without it ────────────────────────────────────
@@ -256,7 +334,7 @@ runs:
         # Sourced rather than inlined so a version bump is a one-file diff with the digest
         # visibly moving alongside the URL. `set -a` exports each KEY=value.
         PINS="${ACTION_DIR}/pins.env"
-        [ -f "$PINS" ] || bail error "pins.env is missing from the action directory — refusing to download anything unpinned"
+        [ -f "$PINS" ] || fatal "pins.env is missing from the action directory — refusing to download anything unpinned"
         set -a
         # shellcheck disable=SC1090
         . "$PINS"
@@ -271,19 +349,25 @@ runs:
           bail error "unsupported runner OS $(uname -s); Visiblaze SAST publishes Linux builds only"
         fi
 
+        # `:-` on every one of these, because `set -u` is in force and they come from a SOURCED
+        # file. A pins.env that is truncated or mis-sourced leaves them unset, and an
+        # unbound-variable expansion aborts the shell ON THE SPOT — before the sentinel loop
+        # below, which exists precisely to name the missing pin and to write status=failed. The
+        # customer got a bare `OPENGREP_URL_LINUX_AMD64: unbound variable`, no annotation, and no
+        # outputs at all. Defaulting to empty lets the real diagnostic run.
         case "$ARCH" in
-          amd64) OPENGREP_URL="${OPENGREP_URL_LINUX_AMD64}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_AMD64}" ;;
-          arm64) OPENGREP_URL="${OPENGREP_URL_LINUX_ARM64}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_ARM64}" ;;
+          amd64) OPENGREP_URL="${OPENGREP_URL_LINUX_AMD64:-}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_AMD64:-}" ;;
+          arm64) OPENGREP_URL="${OPENGREP_URL_LINUX_ARM64:-}"; OPENGREP_SHA="${OPENGREP_SHA256_LINUX_ARM64:-}" ;;
         esac
 
         # Fails closed on an unpopulated pin. This is what makes it impossible to ship or run this
         # action with an unverified dependency: the sentinel is the committed default, so the
         # action is inert until someone deliberately records a real version and digest.
-        for pair in "OPENGREP_VERSION=${OPENGREP_VERSION}" "SCANNER_VERSION=${SCANNER_VERSION}" \
-                    "SCANNER_BASE_URL=${SCANNER_BASE_URL}" \
+        for pair in "OPENGREP_VERSION=${OPENGREP_VERSION:-}" "SCANNER_VERSION=${SCANNER_VERSION:-}" \
+                    "SCANNER_BASE_URL=${SCANNER_BASE_URL:-}" \
                     "OPENGREP_URL=${OPENGREP_URL}" "OPENGREP_SHA256=${OPENGREP_SHA}"; do
           if [ "${pair#*=}" = "UNSET" ] || [ -z "${pair#*=}" ]; then
-            bail error "${pair%%=*} is not pinned in pins.env (still UNSET). This action refuses to download an unpinned binary — see the instructions in pins.env."
+            fatal "${pair%%=*} is not pinned in pins.env (still UNSET). This action refuses to download an unpinned binary — see the instructions in pins.env."
           fi
         done
 
@@ -300,12 +384,12 @@ runs:
           elif command -v shasum >/dev/null 2>&1; then
             actual="$(shasum -a 256 "$file" | awk '{print $1}')"
           else
-            bail error "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
+            fatal "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
           fi
           # Lowercased both sides: a digest pasted from a release page is often uppercase, and a
           # case mismatch must not read as tampering.
           if [ "$(printf '%s' "$actual" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$expected" | tr 'A-Z' 'a-z')" ]; then
-            bail error "checksum mismatch for $(basename "$file") — expected ${expected}, got ${actual}. Nothing was executed. Either the pin is stale or the artefact changed; do not 'fix' this by updating the digest without finding out which."
+            fatal "checksum mismatch for $(basename "$file") — expected ${expected}, got ${actual}. Nothing was executed. Either the pin is stale or the artefact changed; do not 'fix' this by updating the digest without finding out which."
           fi
         }
 
@@ -327,15 +411,17 @@ runs:
         # valid Sigstore signature, including one an attacker minted for a repository they
         # control — the signature would verify and mean nothing. Pinning identity and issuer
         # is what makes this a statement about Opengrep rather than about cryptography.
+        # `:-` for the same reason as the opengrep pins above: unset must reach the sentinel loop
+        # as an empty string, not abort the shell before it can say which pin is missing.
         case "${ARCH}" in
-          amd64) COSIGN_URL="${COSIGN_URL_LINUX_AMD64}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_AMD64}" ;;
-          arm64) COSIGN_URL="${COSIGN_URL_LINUX_ARM64}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_ARM64}" ;;
+          amd64) COSIGN_URL="${COSIGN_URL_LINUX_AMD64:-}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_AMD64:-}" ;;
+          arm64) COSIGN_URL="${COSIGN_URL_LINUX_ARM64:-}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_ARM64:-}" ;;
         esac
         for pair in "COSIGN_URL=${COSIGN_URL}" "COSIGN_SHA256=${COSIGN_SHA}" \
-                    "OPENGREP_CERT_IDENTITY=${OPENGREP_CERT_IDENTITY}" \
-                    "OPENGREP_CERT_OIDC_ISSUER=${OPENGREP_CERT_OIDC_ISSUER}"; do
+                    "OPENGREP_CERT_IDENTITY=${OPENGREP_CERT_IDENTITY:-}" \
+                    "OPENGREP_CERT_OIDC_ISSUER=${OPENGREP_CERT_OIDC_ISSUER:-}"; do
           if [ "${pair#*=}" = "UNSET" ] || [ -z "${pair#*=}" ]; then
-            bail error "${pair%%=*} is not pinned in pins.env. Signature verification cannot be skipped by leaving it blank — fill it in or remove the dependency."
+            fatal "${pair%%=*} is not pinned in pins.env. Signature verification cannot be skipped by leaving it blank — fill it in or remove the dependency."
           fi
         done
 
@@ -376,7 +462,7 @@ runs:
               --certificate-identity "${OPENGREP_CERT_IDENTITY}" \
               --certificate-oidc-issuer "${OPENGREP_CERT_OIDC_ISSUER}" \
               "${WORK}/opengrep" >/dev/null 2>&1; then
-          bail error "opengrep signature verification FAILED. The digest matched but the signature did not verify against ${OPENGREP_CERT_IDENTITY}. Either the pinned identity is stale (upstream moved its release workflow) or these are not the bytes upstream published. Do not proceed by relaxing this check; find out which."
+          fatal "opengrep signature verification FAILED. The digest matched but the signature did not verify against ${OPENGREP_CERT_IDENTITY}. Either the pinned identity is stale (upstream moved its release workflow) or these are not the bytes upstream published. Do not proceed by relaxing this check; find out which."
         fi
         echo "visiblaze-sast: opengrep signature verified (${OPENGREP_CERT_IDENTITY})"
 
@@ -408,13 +494,13 @@ runs:
         # Refused rather than falling back to the release's checksums.txt. A missing pin is the
         # one condition under which a fallback would silently restore exactly the weakness this
         # replaced, on a run that otherwise looks identical.
-        [ -n "$EXPECTED" ] || bail error "pins.env carries no scanner digest for ${ARCH} — refusing to run a scanner this action commit does not pin"
+        [ -n "$EXPECTED" ] || fatal "pins.env carries no scanner digest for ${ARCH} — refusing to run a scanner this action commit does not pin"
         verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
 
         if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
           bail error "could not extract ${SCANNER_TGZ}"
         fi
-        [ -f "${WORK}/visiblaze-scan" ] || bail error "${SCANNER_TGZ} did not contain visiblaze-scan"
+        [ -f "${WORK}/visiblaze-scan" ] || fatal "${SCANNER_TGZ} did not contain visiblaze-scan"
         chmod +x "${WORK}/visiblaze-scan"
 
         # ── Identity ─────────────────────────────────────────────────────────────────────
@@ -446,7 +532,7 @@ runs:
         SCAN_REAL="$(cd "${SCAN_DIR}" 2>/dev/null && pwd -P)" || bail error "could not resolve path '${IN_PATH}'"
         case "${SCAN_REAL}" in
           "${WORKSPACE_REAL}"|"${WORKSPACE_REAL}"/*) ;;
-          *) bail error "path '${IN_PATH}' resolves to ${SCAN_REAL}, which is outside the checkout — refusing to read files this workflow did not check out" ;;
+          *) fatal "path '${IN_PATH}' resolves to ${SCAN_REAL}, which is outside the checkout — refusing to read files this workflow did not check out" ;;
         esac
         SCAN_DIR="${SCAN_REAL}"
 
@@ -467,7 +553,7 @@ runs:
           OLD_IFS="$IFS"; IFS=','
           for entry in ${IN_SCOPE}; do
             case "${entry}" in
-              /*|*..*) IFS="$OLD_IFS"; bail error "scope entry '${entry}' must be a relative path inside the repository" ;;
+              /*|*..*) IFS="$OLD_IFS"; fatal "scope entry '${entry}' must be a relative path inside the repository" ;;
             esac
           done
           IFS="$OLD_IFS"
@@ -503,19 +589,19 @@ runs:
         API_ORIGIN="$(printf '%s' "$VISIBLAZE_API" | awk -F/ '{print $1"//"$3}')"
         case "$VISIBLAZE_API" in
           https://*) ;;
-          *) bail error "api-url must be https, got '${VISIBLAZE_API}'" ;;
+          *) fatal "api-url must be https, got '${VISIBLAZE_API}'" ;;
         esac
         API_OK=""
         # Distinguished from "your origin is not listed" because the fix is different, and because
         # an unquoted multi-origin pins.env produces exactly this state (see pins.env).
-        [ -n "${ALLOWED_API_ORIGINS:-}" ] || bail error "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
+        [ -n "${ALLOWED_API_ORIGINS:-}" ] || fatal "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
         for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
           if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
         done
         # No allowlist at all is refused rather than treated as "anything goes". An empty variable
         # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
         # turn a broken file into a silent removal of this check.
-        [ -n "$API_OK" ] || bail error "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+        [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
 
         [ -n "${IN_RULES_VERSION}" ] && ARGS+=(--rules-version "${IN_RULES_VERSION}")
 
@@ -667,15 +753,27 @@ runs:
         # Exit codes are distinct on purpose and must not be flattened here. 2 means the code has
         # a problem the caller asked to block on; 1 means the tool has a problem. A pipeline that
         # cannot tell those apart learns to ignore both.
+        #
+        # DELIVERY is written to both `status` and `delivery-status` from one variable, so the two
+        # cannot drift: the second exists only to spell the first in the vocabulary the secret
+        # scanner also answers in, and a workflow reading one and getting a different answer from
+        # the other would be worse than the divergence it was added to paper over.
+        #
+        # An `if`, not `[ ... ] && DELIVERY=...`: `set -e` is in force by this point, and a
+        # short-circuiting AND-OR list whose left side is false is exactly the shape that makes
+        # people argue about whether the script exits. Not worth being clever about here.
+        if [ "${DRY_RUN}" = "true" ]; then DELIVERY="dry-run"; else DELIVERY="sent"; fi
         case "$RC" in
           0)
-            echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
+            echo "status=${DELIVERY}" >> "$GITHUB_OUTPUT"
+            echo "delivery-status=${DELIVERY}" >> "$GITHUB_OUTPUT"
             # `policy` is written by the SCANNER, which knows which policy decided. This line used to
             # compute it from --fail-on alone, so a tenant whose ORG policy ran and PASSED was reported
             # as not-applied and a workflow gating on pass could never see one.
             ;;
           2)
-            echo "status=$([ "${DRY_RUN}" = "true" ] && echo dry-run || echo sent)" >> "$GITHUB_OUTPUT"
+            echo "status=${DELIVERY}" >> "$GITHUB_OUTPUT"
+            echo "delivery-status=${DELIVERY}" >> "$GITHUB_OUTPUT"
             # `policy=fail` likewise comes from the scanner, which knows WHICH policy failed.
             # Exit 2 has two causes and they are not interchangeable: the caller's own --fail-on
             # threshold, and the tenant policy the platform sends back with the ingest response.

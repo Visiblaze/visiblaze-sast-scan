@@ -185,8 +185,53 @@ organisation's and lives in Visiblaze. Either can fail a build, and the message 
 | `fail-on-error` | no | `false` | Fail the job if the scan or upload itself fails |
 | `dry-run` | no | `false` | Scan and print what would be sent; upload nothing |
 
-**Outputs:** `findings` (count), `status` (`sent` \| `dry-run` \| `failed`), `policy`
-(`pass` \| `fail` \| `not-applied`).
+Boolean inputs (`fail-on-error`, `dry-run`) accept `true`/`false`, and also `yes`/`no`, `1`/`0`,
+`on`/`off`, in any case. **Anything else is refused and the step fails** rather than being guessed
+at. `dry-run: 'True'` used to compare unequal to `true` and perform a real upload; it now means
+what it says.
+
+## Outputs
+
+| Output | Values | Notes |
+|---|---|---|
+| `findings` | count | Total findings reported |
+| `critical` / `high` / `medium` / `low` | count | Per severity |
+| `status` | `sent` \| `dry-run` \| `failed` | Did this run deliver its result. **Not comparable across Visiblaze actions** — see below |
+| `delivery-status` | `sent` \| `dry-run` \| `failed` | The same answer in the vocabulary every Visiblaze action uses |
+| `policy` | `pass` \| `fail` \| `not-applied` | The gating verdict. Empty if the run reached no verdict |
+| `scan-status` | `complete` \| `partial` | Whether the scan itself finished. A partial run's silence is not evidence |
+| `scanner-version` / `rules-version` | version | So a change in counts can be attributed |
+| `blocking-applied` | `true` \| `false` | Whether your org's pull-request policy actually gated this run |
+| `blocking-skipped-reason` | text | Set only when blocking was asked for and could not be delivered |
+
+### One warning about `status`
+
+The three Visiblaze actions do not agree on how to spell it, and **they never will**, because
+workflows branch on today's values:
+
+| Action | `status` on a successful run |
+|---|---|
+| `visiblaze-sast-scan` | `sent` |
+| `visiblaze-sca-scan` | `sent` (or `partial`) |
+| `visiblaze-secret-scan` | `complete` |
+
+So `if: steps.x.outputs.status == 'sent'` is **silently false** for a secret scan that worked
+perfectly. Use **`delivery-status`** in anything that runs across more than one of them — every
+action answers it with `sent` \| `dry-run` \| `failed` (\| `partial`), and for this action it is
+always identical to `status`.
+
+```yaml
+- id: sast
+  uses: visiblaze/github-action-sast-scan@<sha>
+  # ...
+- id: secrets
+  uses: visiblaze/github-action-secret-scan@<sha>
+  # ...
+- if: steps.sast.outputs.delivery-status == 'sent' && steps.secrets.outputs.delivery-status == 'sent'
+  run: echo "both runs reached Visiblaze"
+```
+
+`status` is not deprecated and is not going away. It is frozen.
 
 ## What the analysis can and cannot find
 
