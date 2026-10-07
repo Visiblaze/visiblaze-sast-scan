@@ -497,6 +497,25 @@ runs:
         [ -n "$EXPECTED" ] || fatal "pins.env carries no scanner digest for ${ARCH} — refusing to run a scanner this action commit does not pin"
         verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
 
+        # Provenance, on top of the digest: the archive was signed (Sigstore keyless) by OUR release
+        # workflow. The digest says these are the bytes this action commit names; the signature says
+        # our release pipeline built them, so a digest recorded in error still cannot point at bytes
+        # we never released. Required once pins.env says the release is signed; releases before
+        # signing existed carry no bundle, and the digest alone stays the control for them.
+        if [ "${SCANNER_SIGNED:-false}" = "true" ]; then
+          if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/${SCANNER_TGZ}.sigstore.json" "${BASE}/${SCANNER_TGZ}.sigstore.json"; then
+            bail error "could not download the signature bundle for ${SCANNER_TGZ} — refusing to run an unverified scanner"
+          fi
+          if ! "${WORK}/cosign" verify-blob \
+                --bundle "${WORK}/${SCANNER_TGZ}.sigstore.json" \
+                --certificate-identity-regexp "${SCANNER_CERT_IDENTITY_REGEXP}" \
+                --certificate-oidc-issuer "${SCANNER_CERT_OIDC_ISSUER}" \
+                "${WORK}/${SCANNER_TGZ}" >/dev/null 2>&1; then
+            fatal "visiblaze-scan signature verification FAILED: the digest matched but the archive was not signed by the Visiblaze release workflow (${SCANNER_CERT_IDENTITY_REGEXP}). Do not proceed by relaxing this check."
+          fi
+          echo "visiblaze-sast: scanner signature verified (Visiblaze release workflow)"
+        fi
+
         if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
           bail error "could not extract ${SCANNER_TGZ}"
         fi
@@ -602,6 +621,14 @@ runs:
         # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
         # turn a broken file into a silent removal of this check.
         [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+        # The scanner also honours VISIBLAZE_RULES_URL from its environment and sends its OIDC
+        # token there. A job-level env would route that token past the allowlist above, so the
+        # rules location is always derived from the checked api-url instead.
+        unset VISIBLAZE_RULES_URL
+        # The public key the platform signs rule packs with. Set, the scanner refuses a fetched
+        # pack whose signature does not verify (and falls back to its embedded pack); empty, it
+        # checks the pack's digest only, as before signing existed.
+        export VISIBLAZE_RULES_PUBKEY="${RULES_SIGNING_PUBKEY:-}"
 
         [ -n "${IN_RULES_VERSION}" ] && ARGS+=(--rules-version "${IN_RULES_VERSION}")
 

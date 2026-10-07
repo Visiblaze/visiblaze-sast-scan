@@ -222,10 +222,10 @@ always identical to `status`.
 
 ```yaml
 - id: sast
-  uses: visiblaze/github-action-sast-scan@<sha>
+  uses: Visiblaze/visiblaze-sast-scan@<sha>
   # ...
 - id: secrets
-  uses: visiblaze/github-action-secret-scan@<sha>
+  uses: Visiblaze/visiblaze-secret-scan@<sha>
   # ...
 - if: steps.sast.outputs.delivery-status == 'sent' && steps.secrets.outputs.delivery-status == 'sent'
   run: echo "both runs reached Visiblaze"
