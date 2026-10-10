@@ -610,20 +610,36 @@ runs:
           https://*) ;;
           *) fatal "api-url must be https, got '${VISIBLAZE_API}'" ;;
         esac
-        API_OK=""
-        # Distinguished from "your origin is not listed" because the fix is different, and because
-        # an unquoted multi-origin pins.env produces exactly this state (see pins.env).
-        [ -n "${ALLOWED_API_ORIGINS:-}" ] || fatal "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
-        for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
-          if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
-        done
-        # No allowlist at all is refused rather than treated as "anything goes". An empty variable
-        # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
-        # turn a broken file into a silent removal of this check.
-        [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+        # A dry run sends nothing, so there is no destination to constrain. The IaC action has
+        # always scoped this same check that way — `if [ "${IN_DRY_RUN}" != "true" ]` in
+        # public/github-action-iac-scan/action.yml — and this one did not, which is the whole
+        # difference. Unscoped, an allowlist meant to govern where findings GO also governs
+        # whether a scan may RUN: .github/workflows/sast-action-smoke.yml is a dry run against a
+        # deliberately unroutable api-url, and it has failed on this line since the allowlist
+        # landed, six weeks before anything ran it again.
+        #
+        # The https check above stays unconditional on purpose. It costs nothing, and catching an
+        # http:// api-url during a dry run is better than catching it on the first real send.
+        if [ "${DRY_RUN}" != "true" ]; then
+          API_OK=""
+          # Distinguished from "your origin is not listed" because the fix is different, and because
+          # an unquoted multi-origin pins.env produces exactly this state (see pins.env).
+          [ -n "${ALLOWED_API_ORIGINS:-}" ] || fatal "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
+          for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
+            if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
+          done
+          # No allowlist at all is refused rather than treated as "anything goes". An empty variable
+          # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would
+          # turn a broken file into a silent removal of this check.
+          [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+        fi
+
         # The scanner also honours VISIBLAZE_RULES_URL from its environment and sends its OIDC
         # token there. A job-level env would route that token past the allowlist above, so the
         # rules location is always derived from the checked api-url instead.
+        #
+        # Unset regardless of dry run. The allowlist above is scoped to real sends because it
+        # governs where findings GO; this governs which RULES EXECUTE, and a dry run executes them.
         unset VISIBLAZE_RULES_URL
         # The public key the platform signs rule packs with. Set, the scanner refuses a fetched
         # pack whose signature does not verify (and falls back to its embedded pack); empty, it
