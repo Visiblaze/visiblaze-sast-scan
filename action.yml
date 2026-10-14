@@ -135,6 +135,26 @@ inputs:
     description: Scan and print what would be sent, upload nothing. Use this for the first run so you can read exactly what leaves.
     required: false
     default: "false"
+  sarif-output:
+    description: >-
+      Also write the findings as a SARIF 2.1.0 file at this path (relative to the workspace), for
+      github/codeql-action/upload-sarif, GitLab or any other SARIF reader. The file holds the same
+      findings as the upload, with inline-suppressed ones marked as suppressions, and no source code.
+      Empty (the default) writes nothing.
+    required: false
+    default: ""
+  import-sarif:
+    description: >-
+      SARIF file(s) another tool wrote (CodeQL, Semgrep, Snyk Code...) to send to Visiblaze as well:
+      a path, a glob, or a comma-separated list. Their findings are shown with the tool's name, are
+      monitored only and never block a pull request, and never close a Visiblaze finding. Recorded
+      for branch runs; on a pull request they are accepted and not stored.
+    required: false
+    default: ""
+  import-tool:
+    description: Tool name to show on imported findings when the SARIF names its tool vaguely or not at all.
+    required: false
+    default: ""
 
 outputs:
   findings:
@@ -176,6 +196,9 @@ outputs:
   low:
     description: Number of low-severity findings.
     value: ${{ steps.scan.outputs.low }}
+  sarif-file:
+    description: Path of the SARIF file written for `sarif-output`, empty when none was written.
+    value: ${{ steps.scan.outputs.sarif-file }}
   scanner-version:
     description: >-
       Version of the Visiblaze scanner that produced this result. Recorded so a change in
@@ -224,6 +247,9 @@ runs:
         IN_MODE: ${{ inputs.mode }}
         IN_RULES_VERSION: ${{ inputs.rules-version }}
         DRY_RUN: ${{ inputs.dry-run }}
+        IN_SARIF_OUTPUT: ${{ inputs.sarif-output }}
+        IN_IMPORT_SARIF: ${{ inputs.import-sarif }}
+        IN_IMPORT_TOOL: ${{ inputs.import-tool }}
         # The pull request's base commit, from the event payload rather than an API call. Empty on
         # a push, which is correct: a push has no proposed change to be new relative to.
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -786,6 +812,44 @@ runs:
           else
             echo "visiblaze-sast: no git history available, so no finding can be shown to be new; nothing will block"
           fi
+        fi
+
+        # ── SARIF file for code scanning ──
+        #
+        # Feature-detected like --base-dir: a pinned scanner older than the flag would reject it and
+        # fail the whole run, so an older pin says so and scans without writing the file.
+        if [ -n "${IN_SARIF_OUTPUT}" ]; then
+          case "${IN_SARIF_OUTPUT}" in
+            /*|*..*) fatal "sarif-output '${IN_SARIF_OUTPUT}' must be a relative path inside the workspace" ;;
+          esac
+          case "$HELP_OUT" in
+            *-sarif-out*) ARGS+=(--sarif-out "${GITHUB_WORKSPACE}/${IN_SARIF_OUTPUT}") ;;
+            *) echo "::warning::visiblaze-sast: this scanner cannot write SARIF; re-pin to a newer scanner to use sarif-output" ;;
+          esac
+        fi
+
+        # ── Other tools' SARIF ──
+        #
+        # Sent BEFORE our own scan, so a run our scan then fails on policy (exit 2) has still
+        # delivered them. Never fatal unless fail-on-error is set: another tool's file being absent
+        # or malformed is not a reason to lose this scan.
+        if [ -n "${IN_IMPORT_SARIF}" ]; then
+          IMPORT_HELP="$("${WORK}/visiblaze-scan" import-sarif --help 2>&1 || true)"
+          case "$IMPORT_HELP" in
+            *-tool-hint*)
+              IMPORT_ARGS=(import-sarif --file "${IN_IMPORT_SARIF}" --dir "${GITHUB_WORKSPACE}"
+                --repo-key "$REPO_KEY" --tenant "$VISIBLAZE_TENANT" --api "$VISIBLAZE_API")
+              [ -n "${IN_IMPORT_TOOL}" ] && IMPORT_ARGS+=(--tool-hint "${IN_IMPORT_TOOL}")
+              [ "${DRY_RUN}" = "true" ] && IMPORT_ARGS+=(--dry-run)
+              if ! (cd "${GITHUB_WORKSPACE}" && "${WORK}/visiblaze-scan" "${IMPORT_ARGS[@]}"); then
+                if [ "${FAIL_ON_ERROR}" = "true" ]; then
+                  fatal "importing ${IN_IMPORT_SARIF} failed"
+                fi
+                echo "::warning::visiblaze-sast: importing ${IN_IMPORT_SARIF} failed; continuing with the Visiblaze scan"
+              fi
+              ;;
+            *) echo "::warning::visiblaze-sast: this scanner cannot import SARIF; re-pin to a newer scanner to use import-sarif" ;;
+          esac
         fi
 
         set +e

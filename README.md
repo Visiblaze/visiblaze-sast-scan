@@ -87,6 +87,13 @@ your GitHub runner  ──►  Visiblaze SAST action  ──►  Opengrep scans 
 
 The source is read on your runner and stays there. What crosses the boundary is finding metadata.
 
+Visiblaze SAST runs the open-source [Opengrep](https://github.com/opengrep/opengrep) engine
+(LGPL-2.1) with the Visiblaze rule pack and Visiblaze's own cross-file analysis engines. Opengrep is
+downloaded unmodified from its upstream release on your runner and verified by digest and signature.
+Opengrep is an independent open-source project; Visiblaze is not affiliated with or endorsed by its
+maintainers, or by Semgrep, Inc. Each finding names the engine that produced it. Full third-party
+details: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 Every binary the action executes is version-pinned and SHA-256 verified before it runs — details in
 [Every binary is pinned and verified](#every-binary-is-pinned-and-verified).
 
@@ -184,6 +191,9 @@ organisation's and lives in Visiblaze. Either can fail a build, and the message 
 | `fail-on` | no | *(empty)* | `critical` \| `high` \| `medium` \| `low` |
 | `fail-on-error` | no | `false` | Fail the job if the scan or upload itself fails |
 | `dry-run` | no | `false` | Scan and print what would be sent; upload nothing |
+| `sarif-output` | no | *(empty)* | Also write a SARIF 2.1.0 file at this workspace-relative path. See below |
+| `import-sarif` | no | *(empty)* | Another tool's SARIF file(s) to send as well: a path, glob or comma-separated list. See below |
+| `import-tool` | no | *(empty)* | Tool name for imported findings when the SARIF names its tool vaguely |
 
 Boolean inputs (`fail-on-error`, `dry-run`) accept `true`/`false`, and also `yes`/`no`, `1`/`0`,
 `on`/`off`, in any case. **Anything else is refused and the step fails** rather than being guessed
@@ -203,6 +213,7 @@ what it says.
 | `scanner-version` / `rules-version` | version | So a change in counts can be attributed |
 | `blocking-applied` | `true` \| `false` | Whether your org's pull-request policy actually gated this run |
 | `blocking-skipped-reason` | text | Set only when blocking was asked for and could not be delivered |
+| `sarif-file` | path | The file written for `sarif-output`; empty when none was |
 
 ### One warning about `status`
 
@@ -232,6 +243,87 @@ always identical to `status`.
 ```
 
 `status` is not deprecated and is not going away. It is frozen.
+
+## Show findings in GitHub code scanning
+
+`sarif-output` writes the same findings the action uploads as a SARIF 2.1.0 file, which
+`github/codeql-action/upload-sarif` turns into alerts in the repository's **Security** tab and as
+annotations on pull requests:
+
+```yaml
+    permissions:
+      contents: read
+      id-token: write          # Visiblaze
+      security-events: write   # code scanning upload
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: Visiblaze/visiblaze-sast-scan@<commit-sha>
+        with:
+          tenant: your-tenant-id
+          api-url: https://<your-visiblaze-ingest-endpoint>/v1/code/findings
+          sarif-output: visiblaze-sast.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()             # upload even when the scan failed the build on policy
+        with:
+          sarif_file: visiblaze-sast.sarif
+          category: visiblaze-sast
+```
+
+- **One `category` per tool.** Code scanning keeps one set of alerts per category and commit, and a
+  second upload under the same category replaces the first. Use `visiblaze-sast` here and
+  `visiblaze-secrets` for the secret scan, and leave CodeQL on its own.
+- **What the file holds.** Rules with their help, CWE tags and a `security-severity` score, every
+  finding with its file, line, taint path and fingerprint, and findings an inline comment suppresses
+  marked as suppressed (so code scanning shows them closed rather than open). No source code.
+- **Private repositories** need GitHub Code Security (GitHub Advanced Security) on the repository for
+  code scanning to accept the upload. Public repositories do not.
+- **Limits.** GitHub accepts up to 10 MB gzipped and 25,000 results per run; the scanner stops at its
+  own 5,000-finding cap long before either.
+- An older scanner pin that does not understand the flag prints a warning and scans without writing
+  the file, rather than failing the job.
+
+The SARIF file is also what GitLab, Azure DevOps Advanced Security, DefectDojo and most other tools
+read, and the same download is available for any repository from the Visiblaze console
+(**Export ▸ SARIF** on the SAST, Secrets and Misconfigurations tabs).
+
+## Bring your other scanners' results
+
+If you also run CodeQL, Semgrep, Snyk Code or any tool that writes SARIF 2.1.0, `import-sarif` sends
+its results to Visiblaze alongside ours:
+
+```yaml
+      - uses: github/codeql-action/analyze@v3
+        with:
+          output: codeql-results     # writes codeql-results/<language>.sarif
+      - uses: Visiblaze/visiblaze-sast-scan@<commit-sha>
+        with:
+          tenant: your-tenant-id
+          api-url: https://<your-visiblaze-ingest-endpoint>/v1/code/findings
+          import-sarif: codeql-results/*.sarif
+```
+
+- Each finding keeps the tool's name, version and original rule id, shows a **Found by** chip, and
+  is grouped into Visiblaze's weakness families by its CWE (or under "Other (*tool*)" when its CWE
+  names none of them). The tool's own rule text is shown as written, credited to the tool.
+- **They never block.** Imported findings are monitored only, whatever your SAST rulesets say, and a
+  pull-request run's imported results are accepted and not stored, so they cannot reach the check.
+- **They never close ours, and ours never close theirs.** A complete upload from a tool resolves only
+  that tool's earlier findings. When two tools report the same weakness in the same file within a few
+  lines, the console shows one issue with both chips and keeps both findings.
+- Results with no rule id, or with no location inside the repository, are dropped and counted, and
+  the code a tool quotes in its trace steps is removed before upload. One upload carries at most
+  5,000 results; above that the first 5,000 are stored and nothing is resolved.
+- A SARIF file written by Visiblaze itself is refused, so nothing is shown twice.
+
+Outside GitHub Actions, the same thing is one command:
+
+```sh
+visiblaze-scan import-sarif --file results.sarif --tool-hint "Snyk Code" \
+  --repo-key github#123 --ref main --commit "$SHA" --tenant acme \
+  --api https://<your-visiblaze-ingest-endpoint>/v1/code/findings --token "$CI_JOB_JWT"
+```
 
 ## What the analysis can and cannot find
 
@@ -299,4 +391,5 @@ it are never marked resolved. Leaving it to `path` avoids that.
 
 ## Licence
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE). Third-party components the action downloads at run time, and
+their licences, are listed in [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
