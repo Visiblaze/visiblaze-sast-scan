@@ -28,7 +28,8 @@ Opengrep — https://github.com/opengrep/opengrep
 
 Sigstore cosign — https://github.com/sigstore/cosign
     Licensed under the Apache License, Version 2.0. Fetched as an unmodified
-    upstream release binary and used only to verify Opengrep's signature.
+    upstream release binary and used only to verify signatures (Opengrep's and
+    the Visiblaze scanner's).
 
 Nothing here is a sublicence. If you redistribute this action together with
 either binary, the obligations of that binary's licence attach to you.

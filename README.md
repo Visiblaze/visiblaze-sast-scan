@@ -1,9 +1,9 @@
 # Visiblaze SAST
 
-Scan source code on your own CI runner. Only findings are sent to Visiblaze — **your code never
-leaves your environment.**
+Scan source code on your own CI runner. Only findings are sent to Visiblaze — **your source files
+are never uploaded.**
 
-- **Runs in your environment.** Opengrep reads your source on your runner. We receive locations, not code.
+- **Runs in your environment.** Opengrep reads your source on your runner. We receive findings and their locations, not your files.
 - **No long-lived CI secrets.** Authentication is short-lived GitHub OIDC. There is nothing to store, rotate, or leak.
 - **Findings join the bigger picture.** Code findings sit alongside cloud, device, posture and runtime context in Visiblaze, so what gets prioritised reflects more than one signal.
 
@@ -101,10 +101,13 @@ Every binary the action executes is version-pinned and SHA-256 verified before i
 
 | Sent | Not sent |
 |---|---|
-| Rule id, severity, confidence | Your source code |
-| File path and line numbers | File contents |
+| Rule id, severity, confidence | Your source files |
+| File path and line numbers | File contents or matched lines |
 | CWE / OWASP references | Your dependencies or lockfiles |
-| Source-to-sink data flow, as file+line steps within one file | Your secrets, environment, or credentials |
+| Source-to-sink data flow, as file+line steps, within a file or across files | Your secrets, environment, or credentials |
+| For a cross-file step, the expression at that step with every literal removed — identifiers and call shape only, e.g. `r.URL.Query(...).Get(...)` → `db.Query` | String, number or other literal values from your code |
+
+`dry-run: true` prints the exact payload without sending it, so you can check this yourself.
 
 The action reads. It does not write, comment, annotate, or open pull requests. The only effect it
 can have on your pipeline is an exit code.
@@ -189,11 +192,12 @@ organisation's and lives in Visiblaze. Either can fail a build, and the message 
 | `path` | no | `.` | Directory to scan; also becomes the declared coverage |
 | `scope` | no | derived from `path` | Comma-separated; for multi-directory jobs only |
 | `fail-on` | no | *(empty)* | `critical` \| `high` \| `medium` \| `low` |
+| `mode` | no | `advisory` | `advisory` reports a broken scan and stays green; `gate` fails the job when the scan or upload fails. Use `gate` where this check is required. Any other value is refused |
+| `rules-version` | no | *(empty)* | Pin the rule pack to an exact version, e.g. `v0.1.0`. Empty uses the pack Visiblaze currently serves. A pinned version that cannot be served fails the scan instead of falling back |
 | `fail-on-error` | no | `false` | Fail the job if the scan or upload itself fails |
 | `dry-run` | no | `false` | Scan and print what would be sent; upload nothing |
 | `sarif-output` | no | *(empty)* | Also write a SARIF 2.1.0 file at this workspace-relative path. See below |
-| `import-sarif` | no | *(empty)* | Another tool's SARIF file(s) to send as well: a path, glob or comma-separated list. See below |
-| `import-tool` | no | *(empty)* | Tool name for imported findings when the SARIF names its tool vaguely |
+| `import-sarif`, `import-tool` | no | *(empty)* | Not supported. Visiblaze does not accept other tools' results; a value is ignored with a warning |
 
 Boolean inputs (`fail-on-error`, `dry-run`) accept `true`/`false`, and also `yes`/`no`, `1`/`0`,
 `on`/`off`, in any case. **Anything else is refused and the step fails** rather than being guessed
@@ -288,48 +292,13 @@ The SARIF file is also what GitLab, Azure DevOps Advanced Security, DefectDojo a
 read, and the same download is available for any repository from the Visiblaze console
 (**Export ▸ SARIF** on the SAST, Secrets and Misconfigurations tabs).
 
-## Bring your other scanners' results
-
-If you also run CodeQL, Semgrep, Snyk Code or any tool that writes SARIF 2.1.0, `import-sarif` sends
-its results to Visiblaze alongside ours:
-
-```yaml
-      - uses: github/codeql-action/analyze@v3
-        with:
-          output: codeql-results     # writes codeql-results/<language>.sarif
-      - uses: Visiblaze/visiblaze-sast-scan@<commit-sha>
-        with:
-          tenant: your-tenant-id
-          api-url: https://<your-visiblaze-ingest-endpoint>/v1/code/findings
-          import-sarif: codeql-results/*.sarif
-```
-
-- Each finding keeps the tool's name, version and original rule id, shows a **Found by** chip, and
-  is grouped into Visiblaze's weakness families by its CWE (or under "Other (*tool*)" when its CWE
-  names none of them). The tool's own rule text is shown as written, credited to the tool.
-- **They never block.** Imported findings are monitored only, whatever your SAST rulesets say, and a
-  pull-request run's imported results are accepted and not stored, so they cannot reach the check.
-- **They never close ours, and ours never close theirs.** A complete upload from a tool resolves only
-  that tool's earlier findings. When two tools report the same weakness in the same file within a few
-  lines, the console shows one issue with both chips and keeps both findings.
-- Results with no rule id, or with no location inside the repository, are dropped and counted, and
-  the code a tool quotes in its trace steps is removed before upload. One upload carries at most
-  5,000 results; above that the first 5,000 are stored and nothing is resolved.
-- A SARIF file written by Visiblaze itself is refused, so nothing is shown twice.
-
-Outside GitHub Actions, the same thing is one command:
-
-```sh
-visiblaze-scan import-sarif --file results.sarif --tool-hint "Snyk Code" \
-  --repo-key github#123 --ref main --commit "$SHA" --tenant acme \
-  --api https://<your-visiblaze-ingest-endpoint>/v1/code/findings --token "$CI_JOB_JWT"
-```
-
 ## What the analysis can and cannot find
 
-The engine follows tainted input **within a single file**. A flow that crosses files — user input
-received in one module, reaching a dangerous call in another — is not reported. That is a real
-ceiling and it is stated here rather than discovered later: a clean result means "nothing found by
+The engine follows tainted input within a file, and **across files** for the cross-file rules: user
+input received in one module and passed through calls until it reaches a dangerous call in another
+is reported, with every hop as a file and line step. Cross-file analysis follows calls it can resolve
+from the source alone, up to a few hops; a flow through reflection, dependency injection the analysis
+cannot see, or a call chain longer than that is not reported. A clean result means "nothing found by
 the checks we run", not "this code is safe".
 
 ## Every binary is pinned and verified

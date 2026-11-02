@@ -7,9 +7,11 @@ then sends Visiblaze a description of what it found. Two properties matter more 
 else in this repository, and both are things you should be able to check rather than take on
 trust:
 
-- **Your source code never leaves your runner.** Opengrep reads it locally. What is transmitted
-  is finding metadata — rule id, severity, file path, line numbers, CWE, a fingerprint. Not file
-  contents, not matched lines, not code snippets, not raw scanner output.
+- **Your source files never leave your runner.** Opengrep reads them locally. What is transmitted
+  is finding metadata — rule id, severity, file path, line numbers, CWE, a fingerprint, and the
+  data-flow steps as file and line. A cross-file step also names the expression at that step as
+  identifiers and call shape, with every literal value removed. Not file contents, not matched
+  lines, not raw scanner output.
 - **A failed scan is never reported as a clean one.** A run that was cut short reports itself as
   partial, and a partial run is never allowed to mark anything as resolved.
 

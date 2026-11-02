@@ -16,10 +16,12 @@
 #
 # ── What this does, and what leaves your network ──
 #
-# The scan runs on YOUR runner, against the checkout that is already there. Your source code is
+# The scan runs on YOUR runner, against the checkout that is already there. Your source files are
 # never uploaded. What leaves is a findings report: rule id, severity, file path, line numbers,
-# and — where the analysis found one — the source-to-sink data flow within a single file. Those
-# are locations in your code, not your code.
+# and — where the analysis found one — the source-to-sink data flow as file and line steps, within
+# a file or across files. Within a file each step carries a fixed note. A cross-file step also
+# names the expression at that step, as identifiers and call shape with every literal removed
+# (`r.URL.Query(...).Get(...)` reaching `db.Query`); no other code and no file contents.
 #
 # It reads. It does not write, comment, annotate, or open pull requests. The only thing it can do
 # to your pipeline is set an exit code, and only if you ask it to with `fail-on`.
@@ -47,7 +49,7 @@
 # review, running on your own runner. For a tool that reads all of your source, readable beats
 # convenient.
 name: Visiblaze SAST
-description: Scan your source for vulnerabilities on your own runner and send only the findings to Visiblaze. Your code never leaves your network.
+description: Scan your source for vulnerabilities on your own runner and send only the findings to Visiblaze. Your source files are never uploaded.
 author: Visiblaze
 
 branding:
@@ -145,14 +147,12 @@ inputs:
     default: ""
   import-sarif:
     description: >-
-      SARIF file(s) another tool wrote (CodeQL, Semgrep, Snyk Code...) to send to Visiblaze as well:
-      a path, a glob, or a comma-separated list. Their findings are shown with the tool's name, are
-      monitored only and never block a pull request, and never close a Visiblaze finding. Recorded
-      for branch runs; on a pull request they are accepted and not stored.
+      Not supported. Visiblaze does not accept results from other tools; a value here is ignored with
+      a warning. Kept so a workflow that still sets it does not fail.
     required: false
     default: ""
   import-tool:
-    description: Tool name to show on imported findings when the SARIF names its tool vaguely or not at all.
+    description: Not supported; ignored. See import-sarif.
     required: false
     default: ""
 
@@ -398,7 +398,20 @@ runs:
         done
 
         WORK="$(mktemp -d)"
-        trap 'rm -rf "$WORK"' EXIT
+        # Composite actions have no post step, so the trap is the cleanup. On a self-hosted runner
+        # the checkout persists between jobs, and the merge-base worktree and the ref fetched for
+        # it would otherwise pile up there run after run. Both are only ever created further down.
+        cleanup() {
+          if [ -n "${BASE_WORKTREE:-}" ] && [ -n "${GITHUB_WORKSPACE:-}" ]; then
+            git -C "${GITHUB_WORKSPACE}" worktree remove --force "${BASE_WORKTREE}" >/dev/null 2>&1 || true
+            git -C "${GITHUB_WORKSPACE}" worktree prune >/dev/null 2>&1 || true
+          fi
+          if [ -n "${BASE_REF_FETCHED:-}" ] && [ -n "${GITHUB_WORKSPACE:-}" ]; then
+            git -C "${GITHUB_WORKSPACE}" update-ref -d refs/visiblaze/base >/dev/null 2>&1 || true
+          fi
+          rm -rf "$WORK"
+        }
+        trap cleanup EXIT
 
         # verify_sha256 is the gate every downloaded executable passes before it is made
         # executable, let alone run. Uses sha256sum where present and shasum otherwise, because
@@ -728,6 +741,7 @@ runs:
             # sent stderr to /dev/null and reported only "could not resolve a merge base", which
             # said nothing about which of four different causes it was.
             GITERR=""
+            BASE_REF_FETCHED="yes"
             if ! git -C "${GITHUB_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
                    origin "+${BASE_SHA}:refs/visiblaze/base" 2>"${WORK}/git.err"; then
               GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
@@ -822,6 +836,22 @@ runs:
           case "${IN_SARIF_OUTPUT}" in
             /*|*..*) fatal "sarif-output '${IN_SARIF_OUTPUT}' must be a relative path inside the workspace" ;;
           esac
+          # The string check above does not stop a symlink. A pull request can commit `reports` as a
+          # link to a directory outside the checkout, or the file itself as a link to one of the
+          # runner's files, and the write would follow it. The directory is resolved and must stay
+          # inside the workspace; an existing symlink at the file's own name is refused here and
+          # again by the scanner, which never writes through one.
+          SARIF_PARENT="$(dirname "${GITHUB_WORKSPACE}/${IN_SARIF_OUTPUT}")"
+          if [ -d "${SARIF_PARENT}" ]; then
+            SARIF_PARENT_REAL="$(cd "${SARIF_PARENT}" && pwd -P)"
+            case "${SARIF_PARENT_REAL}" in
+              "${WORKSPACE_REAL}"|"${WORKSPACE_REAL}"/*) ;;
+              *) fatal "sarif-output '${IN_SARIF_OUTPUT}' resolves to ${SARIF_PARENT_REAL}, outside the checkout — refusing to write there" ;;
+            esac
+          fi
+          if [ -L "${GITHUB_WORKSPACE}/${IN_SARIF_OUTPUT}" ]; then
+            fatal "sarif-output '${IN_SARIF_OUTPUT}' is a symlink in the checkout — refusing to write through it"
+          fi
           case "$HELP_OUT" in
             *-sarif-out*) ARGS+=(--sarif-out "${GITHUB_WORKSPACE}/${IN_SARIF_OUTPUT}") ;;
             *) echo "::warning::visiblaze-sast: this scanner cannot write SARIF; re-pin to a newer scanner to use sarif-output" ;;
@@ -830,26 +860,10 @@ runs:
 
         # ── Other tools' SARIF ──
         #
-        # Sent BEFORE our own scan, so a run our scan then fails on policy (exit 2) has still
-        # delivered them. Never fatal unless fail-on-error is set: another tool's file being absent
-        # or malformed is not a reason to lose this scan.
-        if [ -n "${IN_IMPORT_SARIF}" ]; then
-          IMPORT_HELP="$("${WORK}/visiblaze-scan" import-sarif --help 2>&1 || true)"
-          case "$IMPORT_HELP" in
-            *-tool-hint*)
-              IMPORT_ARGS=(import-sarif --file "${IN_IMPORT_SARIF}" --dir "${GITHUB_WORKSPACE}"
-                --repo-key "$REPO_KEY" --tenant "$VISIBLAZE_TENANT" --api "$VISIBLAZE_API")
-              [ -n "${IN_IMPORT_TOOL}" ] && IMPORT_ARGS+=(--tool-hint "${IN_IMPORT_TOOL}")
-              [ "${DRY_RUN}" = "true" ] && IMPORT_ARGS+=(--dry-run)
-              if ! (cd "${GITHUB_WORKSPACE}" && "${WORK}/visiblaze-scan" "${IMPORT_ARGS[@]}"); then
-                if [ "${FAIL_ON_ERROR}" = "true" ]; then
-                  fatal "importing ${IN_IMPORT_SARIF} failed"
-                fi
-                echo "::warning::visiblaze-sast: importing ${IN_IMPORT_SARIF} failed; continuing with the Visiblaze scan"
-              fi
-              ;;
-            *) echo "::warning::visiblaze-sast: this scanner cannot import SARIF; re-pin to a newer scanner to use import-sarif" ;;
-          esac
+        # Not supported: the platform refuses another tool's results. Warned, never fatal, so a
+        # workflow that still sets the input keeps its Visiblaze scan.
+        if [ -n "${IN_IMPORT_SARIF}" ] || [ -n "${IN_IMPORT_TOOL}" ]; then
+          echo "::warning::visiblaze-sast: import-sarif is not supported and was ignored; remove import-sarif and import-tool from this step"
         fi
 
         set +e
